@@ -1,0 +1,86 @@
+#! groovy
+
+pipeline {
+    agent {
+        label {
+            label 'gce-sct-builders'
+        }
+    }
+    environment {
+        AWS_ACCESS_KEY_ID     = credentials('qa-aws-secret-key-id')
+        AWS_SECRET_ACCESS_KEY = credentials('qa-aws-secret-access-key')
+    }
+    parameters {
+        string(defaultValue: 'test-cases/artifacts/centos7.yaml',
+               description: 'a config file for the coredump test',
+               name: 'test_config')
+    }
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout([time: 30, unit: 'MINUTES'])
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+    stages {
+        stage('Checkout') {
+           steps {
+              dir('scylla-cluster-tests') {
+                  checkout scm
+              }
+           }
+        }
+        stage('Run SCT Test') {
+            steps {
+                catchError(stageResult: 'FAILURE') {
+                    script {
+                        wrap([$class: 'BuildUser']) {
+                            dir('scylla-cluster-tests') {
+                                sh """
+                                #!/bin/bash
+                                set -xe
+                                env
+
+                                export SCT_COLLECT_LOGS=false
+                                export SCT_CONFIG_FILES=${params.test_config}
+
+                                echo "start test ......."
+                                ./docker/env/hydra.sh run-test coredump_test --backend gce --logdir /sct
+                                echo "end test ....."
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Collect log data') {
+            steps {
+                catchError(stageResult: 'FAILURE') {
+                    script {
+                        wrap([$class: 'BuildUser']) {
+                            dir('scylla-cluster-tests') {
+                                sh """
+                                #!/bin/bash
+
+                                set -xe
+                                env
+
+                                export SCT_CONFIG_FILES=${params.test_config}
+
+                                echo "start collect logs ..."
+                                ./docker/env/hydra.sh collect-logs --backend gce --logdir /sct
+                                echo "end collect logs"
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'scylla-cluster-tests/latest/**'
+        }
+    }
+}
