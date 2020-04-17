@@ -20,6 +20,12 @@ from sdcm.keystore import KeyStore
 
 
 DB_NAME = "housekeeping"
+REPO_TABLE = "housekeeping.repo"
+REPODOWNLOAD_TABLE = "housekeeping.repodownload"
+CHECKVERSION_TABLE = "housekeeping.checkversion"
+
+YUM_SUFFIX = "repo"
+APT_SUFFIX = "list"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -73,3 +79,19 @@ class HousekeepingDB:
     def get_new_records(self, query: str, args: Optional[Sequence[Any]] = None, last_id: int = 0) -> Sequence[Row]:
         args = (tuple(args) if args else ()) + (last_id, )
         return self.execute(query + " id > ", args)
+
+
+class PrivateRepo:
+    def __init__(self, uuid, repoid, version, suffix):
+        self.uuid = uuid
+        self.repoid = repoid
+        self.version = version
+        self.suffix = suffix
+
+    def url(self):
+        return f"https://repositories.scylladb.com/scylla/repo/" \
+               f"{self.uuid}/{self.repoid}/scylladb-{self.version}.{self.suffix}"
+
+    @classmethod
+    def from_url(cls, url):
+        pass

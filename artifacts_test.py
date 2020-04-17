@@ -11,13 +11,56 @@
 #
 # Copyright (c) 2020 ScyllaDB
 
+import re
+
 from sdcm.tester import ClusterTester
+from sdcm.utils.decorators import cached_property
+from sdcm.utils.housekeeping import HousekeepingDB, CHECKVERSION_TABLE
 
 
 STRESS_CMD: str = "/usr/bin/cassandra-stress"
+PRIVATE_REPO_RE = re.compile(r"https://repositories.scylladb.com/scylla/repo/"
+                             r"(?P<uuid>[^/]+)/(?P<repoid>[^/]+)/scylladb-(?P<version>[\d.]+)[-.]")
 
 
 class ArtifactsTest(ClusterTester):
+    private_repo_uuid = None
+    private_repo_repoid = None
+    private_repo_version = None
+    housekeeping = None
+
+    def setUp(self):
+        super().setUp()
+
+        match = PRIVATE_REPO_RE.match(self.scylla_repo)
+        if match:
+            self.private_repo_uuid = match.groupdict()["uuid"]
+            self.private_repo_repoid = match.groupdict()["repoid"]
+            self.private_repo_version = match.groupdict()["version"]
+            self.housekeeping = HousekeepingDB.from_keystore_creds()
+            self.housekeeping.connect()
+
+    def tearDown(self):
+        if self.housekeeping:
+            self.housekeeping.close()
+
+        super().tearDown()
+
+    def get_last_id(self) -> int:
+        row = self.housekeeping.get_most_recent_record(f"SELECT * FROM {CHECKVERSION_TABLE} "
+                                                       f"WHERE ruid = %s "
+                                                       f"AND repoid = %s "
+                                                       f"AND version LIKE %s "
+                                                       f"AND statuscode = 'r'",
+                                                       (self.private_repo_uuid,
+                                                        self.private_repo_repoid,
+                                                        self.private_repo_version + "%"))
+        return row[0] if row else 0
+
+    @cached_property
+    def scylla_repo(self):
+        return self.params.get("scylla_repo")
+
     @property
     def node(self):
         return self.db_cluster.nodes[0]
@@ -46,7 +89,11 @@ class ArtifactsTest(ClusterTester):
             self.check_scylla()
 
         with self.subTest("check Scylla server after restart"):
+            if self.housekeeping:
+                last_id = self.get_last_id()
             self.node.restart_scylla(verify_up_after=True)
+            if self.housekeeping:
+                assert last_id < self.get_last_id()
             self.check_scylla()
 
     def get_email_data(self):

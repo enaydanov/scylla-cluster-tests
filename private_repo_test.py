@@ -17,11 +17,9 @@ import json
 import requests
 
 from sdcm.tester import ClusterTester
-from sdcm.utils.housekeeping import HousekeepingDB
+from sdcm.utils.housekeeping import HousekeepingDB, REPO_TABLE, REPODOWNLOAD_TABLE
 
 
-REPO_TABLE = "housekeeping.repo"
-REPODOWNLOAD_TABLE = "housekeeping.repodownload"
 PRIVATE_REPO_BASEURL = "https://repositories.scylladb.com/scylla/"
 SW_REPO_RE = re.compile(PRIVATE_REPO_BASEURL + r"repo/(?P<uuid>[\w-]+)/(?P<ostype>[\w]+)")
 
