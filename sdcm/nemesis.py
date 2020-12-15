@@ -866,12 +866,7 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         self.target_node.run_nodetool('rebuild')
 
     def disrupt_nodetool_cleanup(self):
-        # This fix important when just user profile is run in the test and "keyspace1" doesn't exist.
-        test_keyspaces = self.cluster.get_test_keyspaces()
-        for node in self.cluster.nodes:
-            self._set_current_disruption('NodetoolCleanupMonkey %s' % node, node=node)
-            for keyspace in test_keyspaces:
-                node.run_nodetool(sub_cmd="cleanup", args=keyspace)
+        raise UnsupportedNemesis("NodetoolCleanupMonkey is disabled")
 
     def _prepare_test_table(self, ks='keyspace1', table=None):
         ks_cfs = self.cluster.get_non_system_ks_cf_list(db_node=self.target_node)
