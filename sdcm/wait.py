@@ -58,10 +58,10 @@ def wait_for(func, step=1, text=None, timeout=None, throw_exc=True, **kwargs):
             before_sleep=retry_logger,
             retry=(retry_if_result(lambda value: not value) | retry_if_exception_type())
         )
-        res = retry.call(func, **kwargs)
+        res = retry(func, **kwargs)
 
     except Exception as ex:  # pylint: disable=broad-except
-        err = 'Wait for: {}: timeout - {} seconds - expired'.format(text if text else func.__name__, timeout)
+        err = f'Wait for: {text or func.__name__}: timeout - {timeout} seconds - expired'
         LOGGER.error(err)
         if hasattr(ex, 'last_attempt') and ex.last_attempt.exception() is not None:  # pylint: disable=no-member
             LOGGER.error("last error: %s", repr(ex.last_attempt.exception()))  # pylint: disable=no-member
