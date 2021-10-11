@@ -180,9 +180,9 @@ def latency_calculator_decorator(func):
 
         if "steady" not in func.__name__.lower():
             if func.__name__ not in args[0].cluster.latency_results:
-                args[0].cluster.latency_results[func.__name__] = dict()
+                args[0].cluster.latency_results[func.__name__] = {}
             if 'cycles' not in args[0].cluster.latency_results[func.__name__]:
-                args[0].cluster.latency_results[func.__name__]['cycles'] = list()
+                args[0].cluster.latency_results[func.__name__]['cycles'] = []
         result = latency.collect_latency(monitor, start, end, workload, args[0].cluster, all_nodes_list)
         if "steady" in func.__name__.lower() and \
                 'Steady State' not in args[0].cluster.latency_results:
