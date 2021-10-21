@@ -31,6 +31,6 @@ else
     cd -
     docker login
     echo "Tagging and pushing..."
-    docker push scylladb/hydra:${VERSION}
+#    docker push scylladb/hydra:${VERSION}
     echo "Done."
 fi

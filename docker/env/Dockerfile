@@ -47,3 +47,6 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
 RUN curl -fsSLo /usr/local/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/v$KUBECTL_VERSION/bin/linux/amd64/kubectl && \
     chmod +x /usr/local/bin/kubectl
 COPY --from=python_packages /build /usr/local
+COPY ca.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates --fresh && \
+    cat /usr/local/share/ca-certificates/ca.crt >> $(python -c "import pathlib as p, certifi as c; print(p.Path(c.__file__).with_name('cacert.pem'))")

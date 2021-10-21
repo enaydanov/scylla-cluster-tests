@@ -13,6 +13,8 @@ RUN_BY_USER=$(python3 "${SCT_DIR}/sdcm/utils/get_username.py")
 USER_ID=$(id -u "${USER}")
 HOME_DIR=${HOME}
 
+AWS_MOCK_IP=""
+
 CREATE_RUNNER_INSTANCE=""
 RUNNER_IP_FILE="${SCT_DIR}/sct_runner_ip"
 RUNNER_IP=""
@@ -49,6 +51,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --install-bash-completion|--help)
             SCT_ARGUMENTS+=("$1")
+            shift
+            ;;
+        --aws-mock)
+            AWS_MOCK_IP="$2"
+            shift
             shift
             ;;
         -*|--*)
@@ -161,6 +168,8 @@ else
     DOCKER_GROUP_ARGS='--group-add 1 --group-add 2 --group-add 3'
 fi
 
+DOCKER_ADD_HOST_ARGS=()
+
 # export all SCT_* env vars into the docker run
 SCT_OPTIONS=$(env | grep SCT_ | cut -d "=" -f 1 | xargs -i echo "--env {}")
 
@@ -203,8 +212,10 @@ function run_in_docker () {
             -e _SCT_BASE_DIR="${SCT_DIR}" \
             -e GIT_USER_EMAIL \
             -e RUNNER_IP \
+            -e AWS_MOCK_IP \
             -u ${USER_ID} \
             ${DOCKER_GROUP_ARGS[@]} \
+            ${DOCKER_ADD_HOST_ARGS[@]} \
             ${SCT_OPTIONS} \
             ${PYTEST_OPTIONS} \
             ${BUILD_OPTIONS} \
@@ -238,8 +249,10 @@ function run_in_docker () {
             -e _SCT_BASE_DIR="${SCT_DIR}" \
             -e GIT_USER_EMAIL \
             -e RUNNER_IP \
+            -e AWS_MOCK_IP \
             -u ${USER_ID} \
             ${DOCKER_GROUP_ARGS[@]} \
+            ${DOCKER_ADD_HOST_ARGS[@]} \
             ${SCT_OPTIONS} \
             ${PYTEST_OPTIONS} \
             ${BUILD_OPTIONS} \
@@ -346,6 +359,13 @@ else
             DOCKER_GROUP_ARGS+=(--group-add "$gid")
         done
     fi
+fi
+
+if [[ -n "${AWS_MOCK_IP}" ]]; then
+    for service in $(<"${SCT_DIR}/aws_mock_services"); do
+        echo "Mock requests to ${service} using ${AWS_MOCK_IP}"
+        DOCKER_ADD_HOST_ARGS+=(--add-host "${service}:${AWS_MOCK_IP}")
+    done
 fi
 
 COMMAND=${HYDRA_COMMAND[0]}
