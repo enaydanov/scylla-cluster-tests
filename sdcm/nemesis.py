@@ -705,10 +705,14 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             self.log.info(f"Restarting node {node}")
             node.restart_scylla_server()
 
-    def disrupt_restart_with_resharding(self):
-        murmur3_partitioner_ignore_msb_bits = 15  # pylint: disable=invalid-name
-        self.log.info(f'Restart node with resharding. New murmur3_partitioner_ignore_msb_bits value: '
-                      f'{murmur3_partitioner_ignore_msb_bits}')
+    def disrupt_restart_with_resharding(self) -> None:
+        self.log.info("Clear snapshots before resharding if there are some of them")
+        result = self.target_node.run_nodetool("clearsnapshot")
+        self.log.debug(result)
+
+        murmur3_partitioner_ignore_msb_bits = 15
+        self.log.info("Restart node with resharding. New murmur3_partitioner_ignore_msb_bits value: %s",
+                      murmur3_partitioner_ignore_msb_bits)
         self.target_node.restart_node_with_resharding(
             murmur3_partitioner_ignore_msb_bits=murmur3_partitioner_ignore_msb_bits)
         self.log.info('Waiting scylla services to start after node restart')
