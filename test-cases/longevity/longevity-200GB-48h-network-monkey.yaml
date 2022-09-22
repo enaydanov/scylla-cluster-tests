@@ -33,3 +33,5 @@ authenticator: 'PasswordAuthenticator'
 authenticator_user: cassandra
 authenticator_password: cassandra
 authorizer: 'CassandraAuthorizer'
+
+append_scylla_args: '--logger-log-level gossip=trace'

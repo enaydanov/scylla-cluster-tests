@@ -752,6 +752,7 @@ class BaseNode(AutoSshContainerMixin, WebDriverContainerMixin):  # pylint: disab
         else:
             startup_interface_command = "ip link set {} up"
         self.remoter.sudo(startup_interface_command.format(interface_name))
+        self.remoter.run("ip a", ignore_status=True)
 
     @cached_property
     def is_enterprise(self):
