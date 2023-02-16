@@ -98,6 +98,9 @@ class KeyStore:  # pylint: disable=too-many-public-methods
     def get_argusdb_credentials(self):
         return self.get_json("argusdb_config_v2.json")
 
+    def get_cloud_access(self):
+        return self.get_json("cloud_access.json")
+
 
 def pub_key_from_private_key_file(key_file):
     return paramiko.rsakey.RSAKey.from_private_key_file(os.path.expanduser(key_file)).get_base64()
