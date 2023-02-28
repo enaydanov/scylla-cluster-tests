@@ -3294,6 +3294,9 @@ class BaseCluster:  # pylint: disable=too-many-instance-attributes,too-many-publ
             # default password of Role cassandra is `cassandra`, the weak password isn't allowed in MS-AD.
             if self.added_password_suffix:
                 password = self.params.get('authenticator_password') + DEFAULT_PWD_SUFFIX
+
+        self.log.info("get_db_auth: user=%s, password=%s", user, password)
+
         return (user, password) if user and password else None
 
     def write_node_public_ip_file(self):
@@ -3347,6 +3350,9 @@ class BaseCluster:  # pylint: disable=too-many-instance-attributes,too-many-publ
         kwargs = dict(contact_points=node_ips, port=port, ssl_options=ssl_opts)
         if connection_bundle_file:
             kwargs = dict(scylla_cloud=connection_bundle_file)
+
+        self.log.info("_create_session(): %s", locals())
+
         cluster_driver = ClusterDriver(auth_provider=auth_provider,
                                        compression=compression,
                                        protocol_version=protocol_version,
