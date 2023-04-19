@@ -15,7 +15,7 @@ instance_type_db: 'i4i.4xlarge'
 # Seems the c5.xlarge type is small for this load - I receive OOM on 2 loaders
 instance_type_loader: 'c5.2xlarge'
 
-nemesis_class_name: 'SisyphusMonkey'
+nemesis_class_name: 'ReproMonkey'
 nemesis_seed: '027'
 nemesis_interval: 5
 
