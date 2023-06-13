@@ -1103,7 +1103,8 @@ def list_sct_runners(test_runner_ip: str = None, verbose: bool = True) -> list[S
     else:
         log = LOGGER.debug
     log("Looking for SCT runner instances...")
-    sct_runner_classes = (AwsSctRunner, GceSctRunner, AzureSctRunner, )
+    # sct_runner_classes = (AwsSctRunner, GceSctRunner, AzureSctRunner, )
+    sct_runner_classes = (AwsSctRunner, GceSctRunner, )
     sct_runners = chain.from_iterable(cls.list_sct_runners(verbose=False) for cls in sct_runner_classes)
 
     if test_runner_ip:
