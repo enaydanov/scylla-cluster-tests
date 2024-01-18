@@ -31,3 +31,4 @@ use_mgmt: false
 # SCT_NEW_SCYLLA_REPO=
 
 cs_debug: true
+append_scylla_args: '--blocked-reactor-notify-ms 25 --abort-on-lsa-bad-alloc 1 --abort-on-seastar-bad-alloc --abort-on-internal-error 1 --abort-on-ebadf 1 --enable-sstable-key-validation 1 --logger-log-level cql_server=trace'
