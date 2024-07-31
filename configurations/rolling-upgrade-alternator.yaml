@@ -26,3 +26,5 @@ authorizer: 'CassandraAuthorizer'
 alternator_port: 8080
 alternator_use_dns_routing: true
 docker_network: 'ycsb_net'
+
+append_scylla_args: ' --logger-log-level raft=trace:group0_raft_sm=trace'
