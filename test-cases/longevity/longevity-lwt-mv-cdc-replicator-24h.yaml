@@ -2,24 +2,28 @@ test_duration: 420
 
 prepare_write_cmd:
   - >-
-    latte run -f lwt_insert -P rows_per_partition=1000 --rate 2500 --duration=5000000 --start-cycle 0 --tag lwt-insert-1
+    latte run -f lwt_insert -P rows_per_partition=1000 --rate 10000 --duration=5000000 --start-cycle 0 --tag lwt-insert-1
     data_dir/latte/lwt_mv_cdc_load.rn
 
   - >-
-    latte run -f lwt_insert -P rows_per_partition=1000 --rate 2500 --duration=5000000 --start-cycle 5000001 --tag lwt-insert-2
+    latte run -f lwt_insert -P rows_per_partition=1000 --rate 10000 --duration=5000000 --start-cycle 5000001 --tag lwt-insert-2
     data_dir/latte/lwt_mv_cdc_load.rn
 
 stress_cmd:
   - >-
-    latte run -f upd_first_part --serial-consistency=LOCAL_SERIAL --threads=1 --rate=500 --concurrency=900 --duration=360m --tag upd-first-part
+    latte run -f upd_first_part --serial-consistency=LOCAL_SERIAL --threads=1 --rate=2000 --concurrency=900 --duration=360m --tag upd-first-part
     data_dir/latte/lwt_mv_cdc_load.rn
 
   - >-
-    latte run -f upd_second_part --serial-consistency=LOCAL_SERIAL --threads=1 --rate=500 --concurrency=900 --duration=360m --tag upd-second-part
+    latte run -f upd_second_part --serial-consistency=LOCAL_SERIAL --threads=1 --rate=2000 --concurrency=900 --duration=360m --tag upd-second-part
     data_dir/latte/lwt_mv_cdc_load.rn
 
   - >-
-    latte run -f lwt_read --consistency=QUORUM --threads=1 --rate=800 --concurrency=900 --duration=360m --tag lwt-read --retry-number=10 --retry-interval='500ms,5s' --request-timeout=60
+    latte run -f lwt_read --consistency=LOCAL_SERIAL --threads=1 --rate=800 --concurrency=900 --duration=360m --tag lwt-read
+    data_dir/latte/lwt_mv_cdc_load.rn
+
+  - >-
+    latte run -f lwt_read_mv --consistency=QUORUM --threads=1 --rate=800 --concurrency=900 --duration=360m --tag lwt-read-mv --retry-number=10 --retry-interval='500ms,5s' --request-timeout=60
     data_dir/latte/lwt_mv_cdc_load.rn
 
   - >-
@@ -41,7 +45,7 @@ oracle_scylla_version: ''
 ami_id_db_oracle: 'ami-0c14b7ebb55b4ce15'
 
 nemesis_class_name: 'SisyphusMonkey'
-nemesis_selector: ["topology_changes", "schema_changes and not disruptive"]
+nemesis_selector: ["schema_changes and not disruptive"]
 nemesis_seed: '021'
 nemesis_during_prepare: false
 space_node_threshold: 64424
@@ -52,3 +56,6 @@ use_preinstalled_scylla: true
 
 experimental_features:
   - views-with-tablets
+
+append_scylla_yaml:
+  rf_rack_valid_keyspaces: true
