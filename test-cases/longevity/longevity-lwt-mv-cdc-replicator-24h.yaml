@@ -30,17 +30,17 @@ stress_cmd:
     latte run -f lwt_delete_partitions -P delete_pct=50 --rate 20  --concurrency=10 --duration=360m --tag lwt-delete-partitions
     data_dir/latte/lwt_mv_cdc_load.rn
 
-db_type: 'mixed_scylla'
+#db_type: 'mixed_scylla'
 
 n_db_nodes: 6
 simulated_racks: 3
 n_loaders: 2
 round_robin: true
 
-instance_type_db: 'i4i.large'
+instance_type_db: 'i4i.2xlarge'
 
 n_test_oracle_db_nodes: 3
-instance_type_db_oracle: 'i4i.large'
+instance_type_db_oracle: 'i4i.2xlarge'
 oracle_scylla_version: ''
 ami_id_db_oracle: 'ami-0c14b7ebb55b4ce15'
 

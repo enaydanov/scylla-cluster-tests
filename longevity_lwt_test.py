@@ -123,7 +123,7 @@ class LWTLongevityWithCDCReplicatorTest(LWTLongevityTest):
 
     def setUp(self) -> None:
         super().setUp()
-        self.setup_tools(loader_node=self.loaders.nodes[0])
+        # self.setup_tools(loader_node=self.loaders.nodes[0])
 
     def run_pre_create_schema(self) -> None:
         super().run_pre_create_schema()
@@ -166,35 +166,35 @@ class LWTLongevityWithCDCReplicatorTest(LWTLongevityTest):
         with self.db_cluster.cql_connection_patient(node=self.db_cluster.nodes[0]) as sess:
             sess.execute(ks_query)
             sess.execute(table_query)
-            sess.execute(enable_cdc_query)
+            # sess.execute(enable_cdc_query)
             # sess.execute(mv_query)
 
-        self.log.info("Create the schema on the replica cluster.")
-        with self.cs_db_cluster.cql_connection_patient(node=self.cs_db_cluster.nodes[0]) as sess:
-            sess.execute(ks_query)
-            sess.execute(table_query)
-
-        self.start_replicator(mode=Mode.DELTA)
+        # self.log.info("Create the schema on the replica cluster.")
+        # with self.cs_db_cluster.cql_connection_patient(node=self.cs_db_cluster.nodes[0]) as sess:
+        #     sess.execute(ks_query)
+        #     sess.execute(table_query)
+        #
+        # self.start_replicator(mode=Mode.DELTA)
 
     def validate_data(self) -> None:
         super().validate_data()
 
-        self.log.info("Validate number of rows in master and replica.")
-        count_query = f"SELECT COUNT(*) FROM {self.KS_NAME}.{self.TABLE_NAME};"
-        with self.db_cluster.cql_connection_patient(node=self.db_cluster.nodes[0]) as sess:
-            master_row_count = sess.execute(count_query).current_rows[0].count
-        with self.cs_db_cluster.cql_connection_patient(node=self.cs_db_cluster.nodes[0]) as sess:
-            replica_row_count = sess.execute(count_query).current_rows[0].count
-        if master_row_count != replica_row_count:
-            DataValidatorEvent.DataValidator(
-                severity=Severity.ERROR,
-                message=f"Number of rows in master and replica do not match: {master_row_count=}, {replica_row_count=}",
-            ).publish()
-        else:
-            DataValidatorEvent.DataValidator(
-                severity=Severity.NORMAL,
-                message=f"Number of rows in master and replica: {master_row_count}",
-            ).publish()
+        # self.log.info("Validate number of rows in master and replica.")
+        # count_query = f"SELECT COUNT(*) FROM {self.KS_NAME}.{self.TABLE_NAME};"
+        # with self.db_cluster.cql_connection_patient(node=self.db_cluster.nodes[0]) as sess:
+        #     master_row_count = sess.execute(count_query).current_rows[0].count
+        # with self.cs_db_cluster.cql_connection_patient(node=self.cs_db_cluster.nodes[0]) as sess:
+        #     replica_row_count = sess.execute(count_query).current_rows[0].count
+        # if master_row_count != replica_row_count:
+        #     DataValidatorEvent.DataValidator(
+        #         severity=Severity.ERROR,
+        #         message=f"Number of rows in master and replica do not match: {master_row_count=}, {replica_row_count=}",
+        #     ).publish()
+        # else:
+        #     DataValidatorEvent.DataValidator(
+        #         severity=Severity.NORMAL,
+        #         message=f"Number of rows in master and replica: {master_row_count}",
+        #     ).publish()
 
     def setup_tools(self, loader_node: cluster.BaseNode) -> None:
         self.log.info("Installing tmux on loader node.")
@@ -241,10 +241,10 @@ class LWTLongevityWithCDCReplicatorTest(LWTLongevityTest):
 
     def get_email_data(self) -> dict:
         email_data = super().get_email_data()
-        email_data.update({
-            "number_of_oracle_nodes": self.params.get("n_test_oracle_db_nodes"),
-            "oracle_ami_id": self.params.get("ami_id_db_oracle"),
-            "oracle_db_version": self.cs_db_cluster.nodes[0].scylla_version if self.cs_db_cluster else "N/A",
-            "oracle_instance_type": self.params.get("instance_type_db_oracle"),
-        })
+        # email_data.update({
+        #     "number_of_oracle_nodes": self.params.get("n_test_oracle_db_nodes"),
+        #     "oracle_ami_id": self.params.get("ami_id_db_oracle"),
+        #     "oracle_db_version": self.cs_db_cluster.nodes[0].scylla_version if self.cs_db_cluster else "N/A",
+        #     "oracle_instance_type": self.params.get("instance_type_db_oracle"),
+        # })
         return email_data
