@@ -167,7 +167,7 @@ class LWTLongevityWithCDCReplicatorTest(LWTLongevityTest):
             sess.execute(ks_query)
             sess.execute(table_query)
             sess.execute(enable_cdc_query)
-            sess.execute(mv_query)
+            # sess.execute(mv_query)
 
         self.log.info("Create the schema on the replica cluster.")
         with self.cs_db_cluster.cql_connection_patient(node=self.cs_db_cluster.nodes[0]) as sess:

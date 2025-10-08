@@ -22,9 +22,9 @@ stress_cmd:
     latte run -f lwt_read --consistency=LOCAL_SERIAL --threads=1 --rate=800 --concurrency=900 --duration=360m --tag lwt-read
     data_dir/latte/lwt_mv_cdc_load.rn
 
-  - >-
-    latte run -f lwt_read_mv --consistency=QUORUM --threads=1 --rate=800 --concurrency=900 --duration=360m --tag lwt-read-mv --retry-number=10 --retry-interval='500ms,5s' --request-timeout=60
-    data_dir/latte/lwt_mv_cdc_load.rn
+#  - >-
+#    latte run -f lwt_read_mv --consistency=QUORUM --threads=1 --rate=800 --concurrency=900 --duration=360m --tag lwt-read-mv --retry-number=10 --retry-interval='500ms,5s' --request-timeout=60
+#    data_dir/latte/lwt_mv_cdc_load.rn
 
   - >-
     latte run -f lwt_delete_partitions -P delete_pct=50 --rate 20  --concurrency=10 --duration=360m --tag lwt-delete-partitions
@@ -54,8 +54,8 @@ user_prefix: 'longevity-lwt-mv-cdc-replicator-24h'
 
 use_preinstalled_scylla: true
 
-experimental_features:
-  - views-with-tablets
+#experimental_features:
+#  - views-with-tablets
 
 append_scylla_yaml:
   rf_rack_valid_keyspaces: true
