@@ -134,7 +134,7 @@ class LWTLongevityWithCDCReplicatorTest(LWTLongevityTest):
                 'class'              : 'NetworkTopologyStrategy',
                 'replication_factor' : {self.RF}
             }}
-            AND tablets = {{ 'enabled' : true, 'initial': 1 }}
+            AND tablets = {{ 'enabled' : true }}
         """)
 
         table_query = dedent(f"""\
