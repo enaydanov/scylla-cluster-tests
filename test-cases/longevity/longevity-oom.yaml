@@ -1,0 +1,27 @@
+test_duration: 180
+
+prepare_write_cmd:
+  - >-
+    latte run -f write -P tablets=false -P rows_per_partition=1000 --rate 2500 --duration=10000000 --start-cycle 0 --tag insert
+    data_dir/latte/oom.rn
+
+stress_cmd:
+  - >-
+    latte run -f heavy_read --consistency=QUORUM --threads=100 --rate=3000 --concurrency=100 --duration=60m --tag read --retry-number=10 --retry-interval='500ms,5s' --request-timeout=60
+    data_dir/latte/oom.rn
+
+n_loaders: 3
+n_db_nodes: 30
+
+instance_type_db: 't3.medium'
+data_volume_disk_num: 1
+data_volume_disk_type: "gp3"
+data_volume_disk_size: 500
+data_volume_disk_iops: 3000
+
+user_prefix: 'long-oom'
+cluster_health_check: true
+
+nemesis_class_name: 'StopStartMonkey'
+
+append_scylla_args: '--smp 2 --memory 2148M'
