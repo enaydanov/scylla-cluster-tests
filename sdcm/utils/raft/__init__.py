@@ -460,7 +460,7 @@ class NoRaft(RaftFeatureOperations):
             tokenring_members: list[dict[str, str]]) -> Generator[None, None, None]:
         LOGGER.debug("Raft feature is disabled on node %s (host_id=%s)", self._node.name, self._node.host_id)
 
-        yield None
+        yield from ()
 
     def call_read_barrier(self):
         ...
