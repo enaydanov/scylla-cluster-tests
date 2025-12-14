@@ -831,6 +831,7 @@ class Nemesis(NemesisFlags):
         self.log.debug("Sleep for 60 sec: the other nodes should pull new version")
         time.sleep(60)
 
+    @latency_calculator_decorator(legend="Reboot node")
     @target_all_nodes
     def disrupt_hard_reboot_node(self):
         self.reboot_node(target_node=self.target_node, hard=True)
@@ -5055,6 +5056,9 @@ class Nemesis(NemesisFlags):
         InfoEvent(message="Finished grow disruption").publish()
         for node in new_nodes:
             self.node_allocator.unset_running_nemesis(node, self.current_disruption)
+        time.sleep(sleep_time_between_ops)
+        InfoEvent(message="Starting hard_reboot_node disruption").publish()
+        self.disrupt_hard_reboot_node()
         time.sleep(sleep_time_between_ops)
         InfoEvent(message="Starting terminate_and_replace disruption").publish()
         self._terminate_and_replace_node()
