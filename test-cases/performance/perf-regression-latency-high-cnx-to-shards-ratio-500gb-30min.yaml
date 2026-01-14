@@ -14,7 +14,7 @@ k8s_loader_run_type: 'static'
 n_db_nodes: 3
 n_loaders: 20
 
-instance_type_db: 'i3.4xlarge'
+instance_type_db: 'i8g.4xlarge'
 instance_type_loader: 'c7i.large'
 instance_type_monitor: 'm6i.2xlarge'
 
