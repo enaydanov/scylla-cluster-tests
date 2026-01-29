@@ -18,6 +18,20 @@ class SisyphusMonkey(NemesisRunner):
         self.disruptions_list = self.shuffle_list_of_disruptions(self.disruptions_list)
 
 
+class FullCycleSisyphusMonkey(SisyphusMonkey):
+    """Runs all nemeses from disruptions_list for a specified number of complete cycles."""
+
+    def run(self, interval=None, cycles_count: int = -1):
+        """Run all nemeses from disruptions_list cycles_count complete times.
+
+        Unlike SisyphusMonkey which runs cycles_count individual nemeses,
+        this runs through the entire disruptions_list cycles_count times.
+        """
+        if cycles_count > 0:
+            cycles_count *= len(self.disruptions_list)
+        return super().run(interval=interval, cycles_count=cycles_count)
+
+
 class NoOpMonkey(NemesisRunner):
     kubernetes = True
 

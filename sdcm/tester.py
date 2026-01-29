@@ -165,6 +165,7 @@ from sdcm.sct_events.file_logger import get_events_grouped_by_category, get_logg
 from sdcm.sct_events.events_analyzer import stop_events_analyzer
 from sdcm.sct_events.grafana import start_posting_grafana_annotations
 from sdcm.stress_thread import CassandraStressThread, get_timeout_from_stress_cmd
+from sdcm.py_cassandra_stress_thread import PyCassandraStressThread
 from sdcm.gemini_thread import GeminiStressThread
 from sdcm.utils.log_time_consistency import DbLogTimeConsistencyAnalyzer
 from sdcm.utils.net import get_my_ip, get_sct_runner_ip
@@ -2596,7 +2597,11 @@ class ClusterTester(db_stats.TestStatsMixin, unittest.TestCase):
             stats_aggregate_cmds=stats_aggregate_cmds,
             use_single_loader=use_single_loader,
         )
-        if "cql-stress-cassandra-stress" in stress_cmd:
+        if "py-cassandra-stress" in stress_cmd:
+            params["stop_test_on_failure"] = stop_test_on_failure
+            params["compaction_strategy"] = compaction_strategy
+            return self.run_py_cassandra_stress_thread(**params)
+        elif "cql-stress-cassandra-stress" in stress_cmd:
             params["stop_test_on_failure"] = stop_test_on_failure
             params["compaction_strategy"] = compaction_strategy
             return self.run_cql_stress_cassandra_thread(**params)
@@ -2711,6 +2716,55 @@ class ClusterTester(db_stats.TestStatsMixin, unittest.TestCase):
             )
         stop_test_on_failure = False if not self.params.get("stop_test_on_stress_failure") else stop_test_on_failure
         cs_thread = CqlStressCassandraStressThread(
+            loader_set=self.loaders,
+            stress_cmd=stress_cmd,
+            timeout=timeout,
+            stress_num=stress_num,
+            keyspace_num=keyspace_num,
+            compaction_strategy=compaction_strategy,
+            profile=profile,
+            node_list=self.db_cluster.nodes,
+            round_robin=round_robin,
+            client_encrypt=self.params.get("client_encrypt"),
+            keyspace_name=keyspace_name,
+            stop_test_on_failure=stop_test_on_failure,
+            params=params or self.params,
+        ).run()
+        self.alter_test_tables_encryption(stress_command=stress_cmd)
+        return cs_thread
+
+    def run_py_cassandra_stress_thread(  # noqa: PLR0913
+        self,
+        stress_cmd,
+        duration=None,
+        stress_num=1,
+        keyspace_num=1,
+        profile=None,
+        prefix="",
+        round_robin=False,
+        stats_aggregate_cmds=True,
+        keyspace_name=None,
+        compaction_strategy="",
+        stop_test_on_failure=True,
+        params=None,
+        **_,
+    ):
+        if duration:
+            timeout = self.get_duration(duration)
+            if " duration" in stress_cmd:
+                stress_cmd = re.sub(r"\sduration=\d+[mhd]\s", f" duration={duration}m ", stress_cmd)
+        elif self._stress_duration and " duration=" in stress_cmd:
+            timeout = self.get_duration(self._stress_duration)
+            stress_cmd = re.sub(r"\sduration=\d+[mhd]\s", f" duration={self._stress_duration}m ", stress_cmd)
+        else:
+            timeout = get_timeout_from_stress_cmd(stress_cmd) or self.get_duration(duration)
+
+        if self.create_stats:
+            self.update_stress_cmd_details(
+                stress_cmd, prefix, stresser="cassandra-stress", aggregate=stats_aggregate_cmds
+            )
+        stop_test_on_failure = False if not self.params.get("stop_test_on_stress_failure") else stop_test_on_failure
+        cs_thread = PyCassandraStressThread(
             loader_set=self.loaders,
             stress_cmd=stress_cmd,
             timeout=timeout,

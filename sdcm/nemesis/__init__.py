@@ -530,6 +530,7 @@ class NemesisRunner:
         with self.action_log_scope(f"Start Scylla on {self.target_node.name} node"):
             self.target_node.start_scylla_server(verify_up=True, verify_down=False)
 
+    @latency_calculator_decorator(legend="Restart ScyllaDB service")
     @decorate_with_context(ignore_ycsb_connection_refused)
     def disrupt_stop_start_scylla_server(self):
         with self.action_log_scope(f"Stop Scylla on {self.target_node.name}"):

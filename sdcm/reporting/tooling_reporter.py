@@ -159,6 +159,13 @@ class CqlStressCassandraStressVersionReporter(ToolReporterBase):
             ).report()
 
 
+class PyCassandraStressVersionReporter(PythonDriverReporter):
+    TOOL_NAME = "py-cassandra-stress/python-driver"
+
+    def _collect_version_info(self):
+        self.version = "3.29.3"
+
+
 class LatteVersionReporter(ToolReporterBase):
     TOOL_NAME = "latte"
 

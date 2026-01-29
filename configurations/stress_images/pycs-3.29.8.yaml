@@ -1,0 +1,2 @@
+stress-image:
+  py-cassandra-stress: enaydanov/py-stress:3.29.8

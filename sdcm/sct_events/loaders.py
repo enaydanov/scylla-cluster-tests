@@ -87,6 +87,9 @@ class LatteStressEvent(StressEvent): ...
 class CqlStressCassandraStressEvent(StressEvent): ...
 
 
+class PyCassandraStressEvent(StressEvent): ...
+
+
 class CassandraHarryEvent(StressEvent, abstract=True):
     failure: Type[StressEventProtocol]
     error: Type[SctEventProtocol]
@@ -262,6 +265,12 @@ CqlStressCassandraStressLogEvent.add_subevent_type(
 CQL_STRESS_CS_ERROR_EVENTS = (CqlStressCassandraStressLogEvent.ReadValidationError(),)
 CQL_STRESS_CS_ERROR_EVENTS_PATTERNS: List[Tuple[re.Pattern, LogEventProtocol]] = [
     (re.compile(event.regex), event) for event in CQL_STRESS_CS_ERROR_EVENTS
+]
+
+
+PY_CASSANDRA_STRESS_ERROR_EVENTS = ()
+PY_CASSANDRA_STRESS_ERROR_EVENTS_PATTERNS: List[Tuple[re.Pattern, LogEventProtocol]] = [
+    (re.compile(event.regex), event) for event in PY_CASSANDRA_STRESS_ERROR_EVENTS
 ]
 
 
