@@ -841,6 +841,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "F"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_write_gauge{type=\"lat_perc_95\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "G"
           }
         ],
         "title": "WRITE P95 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -940,6 +947,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "F"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_write_gauge{type=\"lat_perc_95\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "G"
           }
         ],
         "title": "WRITE P95 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1054,6 +1068,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "E"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_read_gauge{type=\"lat_perc_95\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "F"
           }
         ],
         "title": "READ P95 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1146,6 +1167,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "E"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_read_gauge{type=\"lat_perc_95\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "F"
           }
         ],
         "title": "READ P95 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1246,6 +1274,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "C"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_mixed_gauge{type=\"lat_perc_95\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "D"
           }
         ],
         "title": "MIXED P95 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1324,6 +1359,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "C"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_mixed_gauge{type=\"lat_perc_95\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "D"
           }
         ],
         "title": "MIXED P95 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1649,6 +1691,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "F"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_write_gauge{type=\"lat_perc_99\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "G"
           }
         ],
         "title": "WRITE P99 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1748,6 +1797,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "F"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_write_gauge{type=\"lat_perc_99\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "G"
           }
         ],
         "title": "WRITE P99 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1862,6 +1918,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "E"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_read_gauge{type=\"lat_perc_99\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "F"
           }
         ],
         "title": "READ P99 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1954,6 +2017,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "E"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_read_gauge{type=\"lat_perc_99\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "F"
           }
         ],
         "title": "READ P99 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -2054,6 +2124,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "C"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_mixed_gauge{type=\"lat_perc_99\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "D"
           }
         ],
         "title": "MIXED P99 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -2134,6 +2211,13 @@
             "interval": "15s",
             "intervalFactor": 1,
             "refId": "C"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_mixed_gauge{type=\"lat_perc_99\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "D"
           }
         ],
         "title": "MIXED P99 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -7872,6 +7956,98 @@
         "thresholds": [],
         "timeRegions": [],
         "title": "cql-stress-cassandra-stress ops",
+        "tooltip": {
+          "msResolution": false,
+          "shared": true,
+          "sort": 0,
+          "value_type": "cumulative"
+        },
+        "type": "graph",
+        "xaxis": {
+          "mode": "time",
+          "show": true,
+          "values": []
+        },
+        "yaxes": [
+          {
+            "format": "ms",
+            "logBase": 1,
+            "min": 0,
+            "show": true
+          },
+          {
+            "format": "short",
+            "logBase": 1,
+            "show": true
+          }
+        ],
+        "yaxis": {
+          "align": false
+        }
+      },
+      {
+        "aliasColors": {},
+        "bars": false,
+        "class": "graph_panel",
+        "dashLength": 10,
+        "dashes": false,
+        "datasource": "prometheus",
+        "description": "",
+        "editable": true,
+        "error": false,
+        "fill": 0,
+        "fillGradient": 0,
+        "grid": {},
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 0,
+          "y": 280
+        },
+        "hiddenSeries": false,
+        "legend": {
+          "avg": false,
+          "current": false,
+          "max": false,
+          "min": false,
+          "show": false,
+          "total": false,
+          "values": false
+        },
+        "lines": true,
+        "linewidth": 2,
+        "links": [],
+        "nullPointMode": "connected",
+        "options": {
+          "alertThreshold": true
+        },
+        "percentage": false,
+        "pluginVersion": "8.5.2",
+        "pointradius": 1,
+        "points": false,
+        "renderer": "flot",
+        "seriesOverrides": [],
+        "spaceLength": 10,
+        "stack": false,
+        "steppedLine": false,
+        "targets": [
+          {
+            "expr": "sct_py_cassandra_stress_read_gauge{type=\"ops\"}",
+            "format": "time_series",
+            "interval": "15s",
+            "intervalFactor": 1,
+            "refId": "C"
+          },
+          {
+            "expr": "sct_py_cassandra_stress_write_gauge{type=\"ops\"}",
+            "format": "time_series",
+            "intervalFactor": 1,
+            "refId": "A"
+          }
+        ],
+        "thresholds": [],
+        "timeRegions": [],
+        "title": "py-cassandra-stress ops",
         "tooltip": {
           "msResolution": false,
           "shared": true,

@@ -125,6 +125,7 @@ NodetoolEvent: ERROR
 ScyllaBenchEvent: CRITICAL
 CassandraStressEvent: CRITICAL
 CqlStressCassandraStressEvent: CRITICAL
+PyCassandraStressEvent: CRITICAL
 LatteStressEvent: CRITICAL
 GeminiStressEvent: CRITICAL
 ScyllaServerStatusEvent: NORMAL

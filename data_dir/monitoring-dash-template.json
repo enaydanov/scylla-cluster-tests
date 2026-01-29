@@ -205,6 +205,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "F"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_write_gauge{type=\"lat_perc_95\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "G"
                         }
                     ],
                     "title": "WRITE P95 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -270,6 +277,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "F"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_write_gauge{type=\"lat_perc_95\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "G"
                         }
                     ],
                     "title": "WRITE P95 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -313,6 +327,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "E"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_read_gauge{type=\"lat_perc_95\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "F"
                         }
                     ],
                     "title": "READ P95 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -371,6 +392,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "E"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_read_gauge{type=\"lat_perc_95\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "F"
                         }
                     ],
                     "title": "READ P95 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -400,6 +428,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "C"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_mixed_gauge{type=\"lat_perc_95\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "D"
                         }
                     ],
                     "title": "MIXED P95 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -444,6 +479,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "C"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_mixed_gauge{type=\"lat_perc_95\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "D"
                         }
                     ],
                     "title": "MIXED P95 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -583,6 +625,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "F"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_write_gauge{type=\"lat_perc_99\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "G"
                         }
                     ],
                     "title": "WRITE P99 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -648,6 +697,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "F"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_write_gauge{type=\"lat_perc_99\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "G"
                         }
                     ],
                     "title": "WRITE P99 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -691,6 +747,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "E"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_read_gauge{type=\"lat_perc_99\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "F"
                         }
                     ],
                     "title": "READ P99 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -749,6 +812,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "E"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_read_gauge{type=\"lat_perc_99\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "F"
                         }
                     ],
                     "title": "READ P99 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -778,6 +848,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "C"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_mixed_gauge{type=\"lat_perc_99\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "D"
                         }
                     ],
                     "title": "MIXED P99 latency | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -822,6 +899,13 @@
                             "interval": "15s",
                             "intervalFactor": 1,
                             "refId": "C"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_mixed_gauge{type=\"lat_perc_99\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "D"
                         }
                     ],
                     "title": "MIXED P99 latency histogram | C-S and/or CQL-stress and/or Latte benchmarking tools",
@@ -1310,6 +1394,27 @@
                         },
                         {
                             "expr": "sct_cql_stress_cassandra_stress_write_gauge{type=\"ops\"}",
+                            "format": "time_series",
+                            "intervalFactor": 1,
+                            "refId": "A"
+                        }
+                    ],
+                    "type": "graph"
+                },
+                {
+                    "class": "ops_panel",
+                    "span": 6,
+                    "title": "py-cassandra-stress ops",
+                    "targets": [
+                        {
+                            "expr": "sct_py_cassandra_stress_read_gauge{type=\"ops\"}",
+                            "format": "time_series",
+                            "interval": "15s",
+                            "intervalFactor": 1,
+                            "refId": "C"
+                        },
+                        {
+                            "expr": "sct_py_cassandra_stress_write_gauge{type=\"ops\"}",
                             "format": "time_series",
                             "intervalFactor": 1,
                             "refId": "A"

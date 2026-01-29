@@ -159,6 +159,15 @@ class CqlStressCassandraStressVersionReporter(ToolReporterBase):
             ).report()
 
 
+class PyCassandraStressVersionReporter(ToolReporterBase):
+    TOOL_NAME = "py-cassandra-stress/python-driver"
+
+    def _collect_version_info(self):
+        output = self.runner.run(f"{self.command_prefix} python -c 'import cassandra; print(cassandra.__version__)'")
+        LOGGER.debug("%s: Collected scylla-driver version output:\n%s", self, output.stdout)
+        self.version = output.stdout.strip()
+
+
 class LatteVersionReporter(ToolReporterBase):
     TOOL_NAME = "latte"
 
