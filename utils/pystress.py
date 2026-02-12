@@ -69,6 +69,7 @@ class StressConfig:
         self.connections_per_host = None
         self.duration = None
         self.throttle = None
+        self.log_interval = 10  # Default interval for periodic stats (seconds)
 
 
 def parse_metric_suffix(val_str):
@@ -118,6 +119,20 @@ def parse_duration(val_str):
         return int(val_str[:-1]) * 60
     elif val_str.endswith("h"):
         return int(val_str[:-1]) * 3600
+    else:
+        return int(val_str)  # assume seconds
+
+
+def parse_interval(val_str):
+    """
+    Parses interval strings like '10s', '500ms', or '10' (seconds).
+    Only supports 's' (seconds) and 'ms' (milliseconds) suffixes.
+    """
+    val_str = val_str.lower()
+    if val_str.endswith("ms"):
+        return int(val_str[:-2]) / 1000.0
+    elif val_str.endswith("s"):
+        return int(val_str[:-1])
     else:
         return int(val_str)  # assume seconds
 
@@ -277,6 +292,8 @@ def parse_cli_args(args):
                 for part in parts:
                     if "hdrfile=" in part:
                         config.output_file = part.split("=", 1)[1]
+                    elif "interval=" in part:
+                        config.log_interval = parse_interval(part.split("=", 1)[1])
                 i += 1
 
         elif arg == "-mode":
@@ -346,7 +363,9 @@ FLAGS:
                             Example: -pop seq=1..1000000
     -log <options>          Logging options
                             hdrfile=<path>      Output HDR histogram file (default: pystress.hdr)
-                            Example: -log hdrfile=custom.hdr
+                            interval=<time>     Interval for periodic stats output (default: 10)
+                                                Supports suffixes: s (seconds), ms (milliseconds)
+                            Example: -log hdrfile=custom.hdr interval=5s
     -mode <options>         Connection mode options
                             user=<username>     Authentication username
                             password=<password> Authentication password
@@ -385,6 +404,16 @@ class CassandraStressPy:
         # 1 microsec to 1 hour, 3 sig figs
         self.histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
         self.histogram_lock = threading.Lock()
+
+        # Interval statistics tracking
+        self.interval_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
+        self.interval_ops = 0
+        self.interval_errors = 0
+        self.total_ops = 0
+        self.total_errors = 0
+        self.stats_lock = threading.Lock()
+        self.last_interval_time = 0
+        self.stats_header_printed = False
 
         # Pre-cache max payload size if fixed, or just max for buffer if we use it consistently
         if self.config.col_size_dist["type"] == "FIXED":
@@ -550,6 +579,10 @@ class CassandraStressPy:
         throttle_delay = 1.0 / self.config.throttle if self.config.throttle else 0
         next_op_time = start_time
 
+        # Interval stats tracking
+        self.last_interval_time = 0
+        next_interval_time = start_time + self.config.log_interval
+
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = []
             submitted = 0
@@ -560,8 +593,15 @@ class CassandraStressPy:
                     latency_micros = f.result()
                     with self.histogram_lock:
                         self.histogram.record_value(latency_micros)
+                    with self.stats_lock:
+                        self.interval_histogram.record_value(latency_micros)
+                        self.interval_ops += 1
+                        self.total_ops += 1
                 except Exception as e:
                     logger.error(f"Op failed: {e}")
+                    with self.stats_lock:
+                        self.interval_errors += 1
+                        self.total_errors += 1
 
             def pick_session_index():
                 nonlocal session_index
@@ -572,7 +612,6 @@ class CassandraStressPy:
 
             # Define task
             def do_write(key_int, session_idx):
-                t0 = time.perf_counter()
                 # construct args: key + [payloads...]
                 if fixed_payloads:
                     current_payloads = fixed_payloads
@@ -580,12 +619,16 @@ class CassandraStressPy:
                     current_payloads = self._generate_payloads()
 
                 args = [self._generate_key(key_int)] + current_payloads
+
+                t0 = time.perf_counter()
                 self.sessions[session_idx].execute(self.prepared_writes[session_idx], args)
                 return int((time.perf_counter() - t0) * 1_000_000)
 
             def do_read(key_int, session_idx):
+                args = (self._generate_key(key_int),)
+
                 t0 = time.perf_counter()
-                self.sessions[session_idx].execute(self.prepared_reads[session_idx], (self._generate_key(key_int),))
+                self.sessions[session_idx].execute(self.prepared_reads[session_idx], args)
                 return int((time.perf_counter() - t0) * 1_000_000)
 
             task = do_write if self.config.command == "write" else do_read
@@ -636,20 +679,12 @@ class CassandraStressPy:
                         time.sleep(0.005)
                         futures = [fut for fut in futures if not fut.done()]
 
-                if submitted % 10000 == 0:
-                    try:
-                        elapsed = time.perf_counter() - start_time
-                        msg = f"\rElapsed: {elapsed:.1f}s"
-                        if self.config.duration:
-                            msg += f" / {self.config.duration}s"
-                        msg += f", Ops: {submitted}"
-                        if self.config.throttle:
-                            msg += f" (Limit: {self.config.throttle:.0f}/s)"
-                        msg += "..."
-                        sys.stdout.write(msg)
-                        sys.stdout.flush()
-                    except Exception:
-                        pass
+                # Print interval stats periodically
+                now = time.perf_counter()
+                if now >= next_interval_time:
+                    elapsed = now - start_time
+                    self.print_interval_stats(elapsed)
+                    next_interval_time = now + self.config.log_interval
 
             # Wait for remaining
             logger.info("Waiting for pending tasks...")
@@ -679,15 +714,74 @@ class CassandraStressPy:
         except Exception as e:
             logger.error(f"Failed to write HDR file: {e}")
 
+    def print_interval_stats(self, elapsed_time):
+        """Print interval statistics in cassandra-stress format."""
+        with self.stats_lock:
+            if self.interval_ops == 0:
+                return
+
+            # Calculate ops/s for this interval
+            interval_duration = elapsed_time - self.last_interval_time
+            if interval_duration <= 0:
+                return
+
+            ops_per_sec = self.interval_ops / interval_duration
+
+            # Get latency percentiles from interval histogram (convert from us to ms)
+            mean_ms = self.interval_histogram.get_mean_value() / 1000.0
+            median_ms = self.interval_histogram.get_value_at_percentile(50.0) / 1000.0
+            p95_ms = self.interval_histogram.get_value_at_percentile(95.0) / 1000.0
+            p99_ms = self.interval_histogram.get_value_at_percentile(99.0) / 1000.0
+            p999_ms = self.interval_histogram.get_value_at_percentile(99.9) / 1000.0
+            max_ms = self.interval_histogram.get_max_value() / 1000.0
+
+            # Print header once
+            if not self.stats_header_printed:
+                print(
+                    f"{'total ops':>10}, {'op/s':>8}, {'mean':>6}, {'med':>7}, {'.95':>7}, "
+                    f"{'.99':>7}, {'.999':>7}, {'max':>7}, {'time':>6}, {'errors':>7}"
+                )
+                self.stats_header_printed = True
+
+            # Print interval stats
+            print(
+                f"{self.total_ops:>10}, {ops_per_sec:>8.0f}, {mean_ms:>6.1f}, {median_ms:>7.1f}, "
+                f"{p95_ms:>7.1f}, {p99_ms:>7.1f}, {p999_ms:>7.1f}, {max_ms:>7.1f}, "
+                f"{elapsed_time:>6.1f}, {self.interval_errors:>7}"
+            )
+
+            # Reset interval counters
+            self.interval_histogram.reset()
+            self.interval_ops = 0
+            self.interval_errors = 0
+            self.last_interval_time = elapsed_time
+
     def print_summary(self, duration, ops):
-        print("\n--- Summary ---")
-        print(f"Total Operations: {ops}")
-        print(f"Duration: {duration:.2f} s")
-        if duration > 0:
-            print(f"Throughput: {ops / duration:.2f} op/s")
-        print(f"Latency Mean: {self.histogram.get_mean_value():.2f} us")
-        print(f"Latency P99:  {self.histogram.get_value_at_percentile(99.0):.2f} us")
-        print(f"Latency Max:  {self.histogram.get_max_value():.2f} us")
+        op_type = self.config.command.upper()
+        op_rate = ops / duration if duration > 0 else 0
+
+        # Convert microseconds to milliseconds for display
+        latency_mean = self.histogram.get_mean_value() / 1000.0
+        latency_median = self.histogram.get_value_at_percentile(50.0) / 1000.0
+        latency_p95 = self.histogram.get_value_at_percentile(95.0) / 1000.0
+        latency_p99 = self.histogram.get_value_at_percentile(99.0) / 1000.0
+        latency_p999 = self.histogram.get_value_at_percentile(99.9) / 1000.0
+        latency_max = self.histogram.get_max_value() / 1000.0
+
+        # Format duration as HH:MM:SS
+        hours, remainder = divmod(int(duration), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+        print("\nResults:")
+        print(f"Op rate                   : {op_rate:,.0f} op/s  [{op_type}: {op_rate:,.0f} op/s]")
+        print(f"Latency mean              :  {latency_mean:.1f} ms [{op_type}: {latency_mean:.1f} ms]")
+        print(f"Latency median            :  {latency_median:.1f} ms [{op_type}: {latency_median:.1f} ms]")
+        print(f"Latency 95th percentile   :  {latency_p95:.1f} ms [{op_type}: {latency_p95:.1f} ms]")
+        print(f"Latency 99th percentile   :  {latency_p99:.1f} ms [{op_type}: {latency_p99:.1f} ms]")
+        print(f"Latency 99.9th percentile :  {latency_p999:.1f} ms [{op_type}: {latency_p999:.1f} ms]")
+        print(f"Latency max               :  {latency_max:.1f} ms [{op_type}: {latency_max:.1f} ms]")
+        print(f"Total operation time      : {duration_str}")
 
 
 if __name__ == "__main__":
