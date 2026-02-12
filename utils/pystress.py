@@ -42,7 +42,6 @@ from hdrh.log import HistogramLogWriter
 
 logger = logging.getLogger(__name__)
 
-KEYSPACE_NAME = "keyspace1"
 TABLE_NAME = "standard1"
 
 
@@ -60,6 +59,9 @@ class StressConfig:
         self.nodes = ["127.0.0.1"]
         self.replication_factor = 1
         self.replication_strategy = "SimpleStrategy"
+        self.keyspace_name = "keyspace1"
+        self.compaction_strategy = None
+        self.compression = None
         self.pop_dist = "seq"
         self.pop_min = 1
         self.pop_max = 1000000
@@ -135,6 +137,68 @@ def parse_interval(val_str):
         return int(val_str[:-1])
     else:
         return int(val_str)  # assume seconds
+
+
+def parse_schema_option(schema_str):
+    """
+    Parse cassandra-stress style schema options.
+
+    Format:
+        replication(strategy=? replication_factor=?)
+        keyspace=?
+        compaction(strategy=?)
+        compression=?
+
+    Examples:
+        "replication(replication_factor=3) keyspace=test"
+        "replication(strategy=NetworkTopologyStrategy replication_factor=3)"
+        "compaction(strategy=LeveledCompactionStrategy)"
+    """
+    result = {
+        "keyspace": "keyspace1",
+        "replication_strategy": "SimpleStrategy",
+        "replication_factor": 1,
+        "compaction_strategy": None,
+        "compression": None,
+    }
+
+    # Parse replication(...)
+    replication_match = re.search(r"replication\s*\(([^)]+)\)", schema_str, re.IGNORECASE)
+    if replication_match:
+        repl_content = replication_match.group(1)
+        # Extract strategy=
+        strategy_match = re.search(r"strategy\s*=\s*(\S+)", repl_content, re.IGNORECASE)
+        if strategy_match:
+            strategy = strategy_match.group(1)
+            # Handle full class names or short names
+            if "NetworkTopologyStrategy" in strategy:
+                result["replication_strategy"] = "NetworkTopologyStrategy"
+            else:
+                result["replication_strategy"] = "SimpleStrategy"
+        # Extract replication_factor=
+        factor_match = re.search(r"replication_factor\s*=\s*(\d+)", repl_content, re.IGNORECASE)
+        if factor_match:
+            result["replication_factor"] = int(factor_match.group(1))
+
+    # Parse keyspace=
+    keyspace_match = re.search(r"keyspace\s*=\s*([a-zA-Z0-9_]+)", schema_str, re.IGNORECASE)
+    if keyspace_match:
+        result["keyspace"] = keyspace_match.group(1)
+
+    # Parse compaction(...)
+    compaction_match = re.search(r"compaction\s*\(([^)]+)\)", schema_str, re.IGNORECASE)
+    if compaction_match:
+        comp_content = compaction_match.group(1)
+        strategy_match = re.search(r"strategy\s*=\s*(\S+)", comp_content, re.IGNORECASE)
+        if strategy_match:
+            result["compaction_strategy"] = strategy_match.group(1)
+
+    # Parse compression=
+    compression_match = re.search(r"compression\s*=\s*(\S+)", schema_str, re.IGNORECASE)
+    if compression_match:
+        result["compression"] = compression_match.group(1)
+
+    return result
 
 
 def parse_cli_args(args):
@@ -255,16 +319,18 @@ def parse_cli_args(args):
 
         elif arg == "-schema":
             i += 1
-            if i < len(args):
-                # Simplified schema parsing
-                schema_arg = args[i]
-                if "replication_factor" in schema_arg:
-                    val = re.findall(r"replication_factor[=\s]*(\d+)", schema_arg)
-                    if val:
-                        config.replication_factor = int(val[0])
-                if "NetworkTopologyStrategy" in schema_arg:
-                    config.replication_strategy = "NetworkTopologyStrategy"
-            i += 1
+            schema_parts = []
+            while i < len(args) and not args[i].startswith("-"):
+                schema_parts.append(args[i])
+                i += 1
+            if schema_parts:
+                schema_str = " ".join(schema_parts)
+                parsed = parse_schema_option(schema_str)
+                config.keyspace_name = parsed["keyspace"]
+                config.replication_strategy = parsed["replication_strategy"]
+                config.replication_factor = parsed["replication_factor"]
+                config.compaction_strategy = parsed["compaction_strategy"]
+                config.compression = parsed["compression"]
 
         elif arg == "-pop":
             i += 1
@@ -354,9 +420,14 @@ FLAGS:
                             Distributions: FIXED(value), UNIFORM(min..max)
                             Example: -col size=FIXED(1024) n=FIXED(5)
     -schema <options>       Schema options
-                            replication_factor=<number> (default: 1)
-                            NetworkTopologyStrategy (default: SimpleStrategy)
-                            Example: -schema replication_factor=3
+                            replication(strategy=? replication_factor=?)  Replication settings
+                                strategy=? (default: SimpleStrategy)
+                                replication_factor=? (default: 1)
+                            keyspace=? (default: keyspace1)
+                            compaction(strategy=?)  Compaction strategy
+                            compression=?           Compression setting
+                            Example: -schema 'replication(replication_factor=3) keyspace=test'
+                            Example: -schema 'replication(strategy=NetworkTopologyStrategy replication_factor=3) compaction(strategy=LeveledCompactionStrategy)'
     -pop <options>          Population distribution
                             seq=<min>..<max>    Sequential range (default)
                             dist=gauss(<mean>)  Gaussian distribution
@@ -464,15 +535,27 @@ class CassandraStressPy:
         else:
             strategy = f"{{'class': 'SimpleStrategy', 'replication_factor': {self.config.replication_factor}}}"
 
+        keyspace_name = self.config.keyspace_name
         session = self.sessions[0]
-        session.execute(f"CREATE KEYSPACE IF NOT EXISTS {KEYSPACE_NAME} WITH replication = {strategy}")
-        session.execute(f"USE {KEYSPACE_NAME}")
+        session.execute(f"CREATE KEYSPACE IF NOT EXISTS {keyspace_name} WITH replication = {strategy}")
+        session.execute(f"USE {keyspace_name}")
 
         # Mimic standard1 table
         # We start columns from C1 because C0 is often used but cassandra-stress uses C0..CN.
         # Standard1 in cassandra-stress usually (key, C0, C1, C2, C3, C4)
         cols = ", ".join([f'"C{i}" blob' for i in range(self.config.col_count)])
         stmt = f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} (key blob PRIMARY KEY, {cols})"
+
+        # Add table options (compaction and compression)
+        table_options = []
+        if self.config.compaction_strategy:
+            table_options.append(f"compaction = {{'class': '{self.config.compaction_strategy}'}}")
+        if self.config.compression:
+            table_options.append(f"compression = {{'sstable_compression': '{self.config.compression}'}}")
+
+        if table_options:
+            stmt += " WITH " + " AND ".join(table_options)
+
         session.execute(stmt)
 
         placeholders = ", ".join(["?"] * self.config.col_count)
@@ -484,7 +567,7 @@ class CassandraStressPy:
         self.prepared_writes = []
         self.prepared_reads = []
         for prep_session in self.sessions:
-            prep_session.set_keyspace(KEYSPACE_NAME)
+            prep_session.set_keyspace(keyspace_name)
             logger.info(f"Prepare Write: {write_q}")
             self.prepared_writes.append(prep_session.prepare(write_q))
             logger.info(f"Prepare Read: {read_q}")
