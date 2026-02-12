@@ -78,6 +78,22 @@
   - Latencies displayed in milliseconds for consistency with cassandra-stress.
   - Duration formatted as `HH:MM:SS`.
 
+### 9. Add Support for `-schema` Option (cassandra-stress format)
+- **Objective**: Support the full cassandra-stress `-schema` option format.
+- **Details**:
+  - Parse nested function-style options matching cassandra-stress format:
+    - `replication(strategy=? replication_factor=?)` - Replication settings
+      - `strategy=?` (default: SimpleStrategy)
+      - `replication_factor=?` (default: 1)
+    - `keyspace=?` (default: keyspace1)
+    - `compaction(strategy=?)` - Compaction strategy (e.g., LeveledCompactionStrategy)
+    - `compression=?` - Compression setting (e.g., LZ4Compressor)
+  - Examples:
+    - `-schema 'replication(replication_factor=3)'`
+    - `-schema 'replication(strategy=NetworkTopologyStrategy replication_factor=3) keyspace=test'`
+    - `-schema 'replication(replication_factor=3) compaction(strategy=SizeTieredCompactionStrategy)'`
+    - `-schema 'keyspace=mystress compaction(strategy=LeveledCompactionStrategy) compression=LZ4Compressor'`
+
 ---
 
 ## CLI Options Reference
@@ -95,7 +111,7 @@
 | `-rate` | Rate limiting options | `-rate threads=10 throttle=1000/s` |
 | `-col` | Column configuration | `-col 'size=FIXED(1024) n=FIXED(5)'` |
 | `-log` | Logging options | `-log hdrfile=output.hdr interval=30s` |
-| `-schema` | Schema options | `-schema 'replication(factor=3)'` |
+| `-schema` | Schema options (keyspace, replication) | `-schema 'keyspace=mystress replication_factor=3'` |
 | `-pop` | Population distribution | `-pop 'seq=1..1000000'` |
 | `--help` | Show help message | `pystress.py --help` |
 
