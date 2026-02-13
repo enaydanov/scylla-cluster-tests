@@ -33,6 +33,7 @@ import threading
 import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
+from datetime import datetime
 
 from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.policies import TokenAwarePolicy, DCAwareRoundRobinPolicy
@@ -44,6 +45,63 @@ from hdrh.log import HistogramLogWriter
 logger = logging.getLogger(__name__)
 
 TABLE_NAME = "standard1"
+
+
+class TaggedHistogramLogWriter(HistogramLogWriter):
+    """Extended HistogramLogWriter that supports tag output in histogram lines.
+
+    The standard HistogramLogWriter does not output the histogram's tag even when set.
+    This subclass overrides output_interval_histogram() to include the tag prefix
+    in the format: Tag=<tag>,<start>,<interval>,<max>,<encoded>
+    """
+
+    def output_start_time(self, start_time_msec):
+        """Log a start time in the log.
+        Params:
+            start_time_msec time (in milliseconds) since the absolute start time (the epoch)
+        """
+        start_time_sec = float(start_time_msec) / 1000.0
+        datetime_formatted = datetime.fromtimestamp(start_time_sec).isoformat(" ")
+        self.log.write(f"#[StartTime: {start_time_sec} (seconds since epoch), {datetime_formatted}]\n")
+
+    def output_interval_histogram(
+        self, histogram, start_time_stamp_sec=0, end_time_stamp_sec=0, max_value_unit_ratio=1000000.0
+    ):
+        """Output an interval histogram with optional tag support.
+
+        If the histogram has a tag set (via histogram.set_tag()), it will be
+        included in the output line as: Tag=<tag>,<start>,<interval>,<max>,<encoded>
+        """
+        if not start_time_stamp_sec:
+            start_time_stamp_sec = (histogram.get_start_time_stamp() - self.base_time) / 1000.0
+        if not end_time_stamp_sec:
+            end_time_stamp_sec = (histogram.get_end_time_stamp() - self.base_time) / 1000.0
+
+        cpayload = histogram.encode()
+
+        # Check if histogram has a tag and include it in output
+        tag = histogram.get_tag()
+        if tag:
+            self.log.write(
+                "Tag=%s,%f,%f,%f,%s\n"
+                % (
+                    tag,
+                    start_time_stamp_sec,
+                    end_time_stamp_sec - start_time_stamp_sec,
+                    histogram.get_max_value() // max_value_unit_ratio,
+                    cpayload.decode("utf-8"),
+                )
+            )
+        else:
+            self.log.write(
+                "%f,%f,%f,%s\n"
+                % (
+                    start_time_stamp_sec,
+                    end_time_stamp_sec - start_time_stamp_sec,
+                    histogram.get_max_value() // max_value_unit_ratio,
+                    cpayload.decode("utf-8"),
+                )
+            )
 
 
 class PopDistribution(TypedDict):
@@ -559,19 +617,32 @@ class CassandraStressPy:
         self.sessions = []
         self.prepared_writes = []
         self.prepared_reads = []
-        # 1 microsec to 1 hour, 3 sig figs
-        self.histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
         self.histogram_lock = threading.Lock()
 
+        # Separate histograms for READ and WRITE operations (1 microsec to 1 hour, 3 sig figs)
+        # Summary histograms - accumulated across all intervals for final summary
+        self.write_summary_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
+        self.read_summary_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
+
+        # Interval histograms - reset after each interval output
+        self.write_interval_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
+        self.read_interval_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
+
         # Interval statistics tracking
-        self.interval_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
-        self.interval_ops = 0
+        self.write_interval_ops = 0
+        self.read_interval_ops = 0
         self.interval_errors = 0
-        self.total_ops = 0
+        self.total_write_ops = 0
+        self.total_read_ops = 0
         self.total_errors = 0
         self.stats_lock = threading.Lock()
         self.last_interval_time = 0
         self.stats_header_printed = False
+
+        # HDR file writer (initialized in run())
+        self.hdr_file = None
+        self.hdr_writer = None
+        self.start_timestamp = None
 
         # Pre-cache max payload size if fixed, or just max for buffer if we use it consistently
         if self.config.col_size_dist["type"] == "FIXED":
@@ -710,6 +781,10 @@ class CassandraStressPy:
         )
 
         start_time = time.perf_counter()
+        self.start_timestamp = time.time() * 1000  # Epoch milliseconds for HDR file header
+
+        # Initialize HDR file writer
+        self._init_hdr_writer()
 
         # Generator for keys based on population distribution
         if self.config.pop_dist == "gaussian":
@@ -767,16 +842,24 @@ class CassandraStressPy:
             futures = []
             submitted = 0
 
-            # Helper to process result
-            def on_done(f):
+            # Helper to process result with operation type
+            def on_done(f, op_type):
                 try:
                     latency_micros = f.result()
                     with self.histogram_lock:
-                        self.histogram.record_value(latency_micros)
+                        if op_type == "write":
+                            self.write_summary_histogram.record_value(latency_micros)
+                            self.write_interval_histogram.record_value(latency_micros)
+                        else:
+                            self.read_summary_histogram.record_value(latency_micros)
+                            self.read_interval_histogram.record_value(latency_micros)
                     with self.stats_lock:
-                        self.interval_histogram.record_value(latency_micros)
-                        self.interval_ops += 1
-                        self.total_ops += 1
+                        if op_type == "write":
+                            self.write_interval_ops += 1
+                            self.total_write_ops += 1
+                        else:
+                            self.read_interval_ops += 1
+                            self.total_read_ops += 1
                 except Exception as e:
                     logger.error(f"Op failed: {e}")
                     with self.stats_lock:
@@ -810,6 +893,14 @@ class CassandraStressPy:
                 t0 = time.perf_counter()
                 self.sessions[session_idx].execute(self.prepared_reads[session_idx], args)
                 return int((time.perf_counter() - t0) * 1_000_000)
+
+            # Determine operation type for callbacks
+            if self.config.command == "write":
+                op_type = "write"
+            elif self.config.command == "read":
+                op_type = "read"
+            else:
+                op_type = "mixed"  # Will be determined per-operation
 
             task = do_write if self.config.command == "write" else do_read
 
@@ -846,8 +937,22 @@ class CassandraStressPy:
                     break
 
                 idx = pick_session_index()
-                f = executor.submit(task, k, idx)
-                f.add_done_callback(on_done)
+
+                # For mixed workload, randomly choose read or write
+                if op_type == "mixed":
+                    if random.random() < 0.5:
+                        current_op_type = "write"
+                        current_task = do_write
+                    else:
+                        current_op_type = "read"
+                        current_task = do_read
+                else:
+                    current_op_type = op_type
+                    current_task = task
+
+                f = executor.submit(current_task, k, idx)
+                # Use functools.partial-like binding via lambda with default arg capture
+                f.add_done_callback(lambda fut, ot=current_op_type: on_done(fut, ot))
                 futures.append(f)
                 submitted += 1
 
@@ -863,6 +968,7 @@ class CassandraStressPy:
                 now = time.perf_counter()
                 if now >= next_interval_time:
                     elapsed = now - start_time
+                    self._output_interval_histograms(elapsed)
                     self.print_interval_stats(elapsed)
                     next_interval_time = now + self.config.log_interval
 
@@ -875,29 +981,72 @@ class CassandraStressPy:
                     pass  # Handled in callback
 
         total_duration = time.perf_counter() - start_time
+
+        # Output final interval stats (for any remaining data not yet output)
+        self._output_interval_histograms(total_duration)
+        self.print_interval_stats(total_duration)
+
         print("\nDone.")
         self.save_hdr()
         self.print_summary(total_duration, submitted)
         for cluster in self.clusters:
             cluster.shutdown()
 
-    def save_hdr(self):
-        logger.info(f"Saving HDR histogram to {self.config.output_file}...")
+    def _init_hdr_writer(self):
+        """Initialize HDR histogram file writer with headers."""
         try:
-            with open(self.config.output_file, "w") as f:
-                writer = HistogramLogWriter(f)
-                writer.output_log_format_version()
-                writer.output_comment(f"pystress command={self.config.command}")
-                writer.output_legend()
-                # We output one interval covering the whole test
-                writer.output_interval_histogram(self.histogram)
+            self.hdr_file = open(self.config.output_file, "w")
+            self.hdr_writer = TaggedHistogramLogWriter(self.hdr_file)
+
+            # Match cassandra-stress header format
+            self.hdr_writer.output_comment("Logging op latencies for Cassandra Stress")
+            self.hdr_writer.output_log_format_version()  # 1.2 (Python library limitation)
+            self.hdr_writer.output_base_time(self.start_timestamp)
+            self.hdr_writer.output_start_time(self.start_timestamp)
+            self.hdr_writer.output_legend()
         except Exception as e:
-            logger.error(f"Failed to write HDR file: {e}")
+            logger.error(f"Failed to initialize HDR file: {e}")
+            self.hdr_file = None
+            self.hdr_writer = None
+
+    def _output_interval_histograms(self, elapsed_time):
+        """Output interval histograms to HDR file."""
+        if not self.hdr_writer:
+            return
+
+        with self.histogram_lock:
+            # Calculate timestamps for this interval (in milliseconds)
+            interval_start_ms = int(self.last_interval_time * 1000)
+            interval_end_ms = int(elapsed_time * 1000)
+
+            # Output WRITE histogram if has data
+            if self.write_interval_histogram.get_total_count() > 0:
+                self.write_interval_histogram.set_tag("WRITE-st")
+                self.write_interval_histogram.set_start_time_stamp(interval_start_ms)
+                self.write_interval_histogram.set_end_time_stamp(interval_end_ms)
+                self.hdr_writer.output_interval_histogram(self.write_interval_histogram)
+
+            # Output READ histogram if has data
+            if self.read_interval_histogram.get_total_count() > 0:
+                self.read_interval_histogram.set_tag("READ-st")
+                self.read_interval_histogram.set_start_time_stamp(interval_start_ms)
+                self.read_interval_histogram.set_end_time_stamp(interval_end_ms)
+                self.hdr_writer.output_interval_histogram(self.read_interval_histogram)
+
+    def save_hdr(self):
+        """Close HDR histogram file."""
+        if self.hdr_file:
+            try:
+                self.hdr_file.close()
+                logger.info(f"HDR histogram saved to {self.config.output_file}")
+            except Exception as e:
+                logger.error(f"Failed to close HDR file: {e}")
 
     def print_interval_stats(self, elapsed_time):
         """Print interval statistics in cassandra-stress format."""
         with self.stats_lock:
-            if self.interval_ops == 0:
+            total_interval_ops = self.write_interval_ops + self.read_interval_ops
+            if total_interval_ops == 0:
                 return
 
             # Calculate ops/s for this interval
@@ -905,15 +1054,59 @@ class CassandraStressPy:
             if interval_duration <= 0:
                 return
 
-            ops_per_sec = self.interval_ops / interval_duration
+            ops_per_sec = total_interval_ops / interval_duration
 
-            # Get latency percentiles from interval histogram (convert from us to ms)
-            mean_ms = self.interval_histogram.get_mean_value() / 1000.0
-            median_ms = self.interval_histogram.get_value_at_percentile(50.0) / 1000.0
-            p95_ms = self.interval_histogram.get_value_at_percentile(95.0) / 1000.0
-            p99_ms = self.interval_histogram.get_value_at_percentile(99.0) / 1000.0
-            p999_ms = self.interval_histogram.get_value_at_percentile(99.9) / 1000.0
-            max_ms = self.interval_histogram.get_max_value() / 1000.0
+            # Combine read and write histograms for console stats
+            # We need to get combined stats from both histograms
+            with self.histogram_lock:
+                write_count = self.write_interval_histogram.get_total_count()
+                read_count = self.read_interval_histogram.get_total_count()
+
+                if write_count > 0 and read_count > 0:
+                    # Combine stats weighted by count
+                    total_count = write_count + read_count
+                    mean_ms = (
+                        (
+                            self.write_interval_histogram.get_mean_value() * write_count
+                            + self.read_interval_histogram.get_mean_value() * read_count
+                        )
+                        / total_count
+                        / 1000.0
+                    )
+                    # For percentiles, use the histogram with more samples (approximate)
+                    if write_count >= read_count:
+                        hist = self.write_interval_histogram
+                    else:
+                        hist = self.read_interval_histogram
+                    median_ms = hist.get_value_at_percentile(50.0) / 1000.0
+                    p95_ms = hist.get_value_at_percentile(95.0) / 1000.0
+                    p99_ms = hist.get_value_at_percentile(99.0) / 1000.0
+                    p999_ms = hist.get_value_at_percentile(99.9) / 1000.0
+                    max_ms = (
+                        max(
+                            self.write_interval_histogram.get_max_value(),
+                            self.read_interval_histogram.get_max_value(),
+                        )
+                        / 1000.0
+                    )
+                elif write_count > 0:
+                    mean_ms = self.write_interval_histogram.get_mean_value() / 1000.0
+                    median_ms = self.write_interval_histogram.get_value_at_percentile(50.0) / 1000.0
+                    p95_ms = self.write_interval_histogram.get_value_at_percentile(95.0) / 1000.0
+                    p99_ms = self.write_interval_histogram.get_value_at_percentile(99.0) / 1000.0
+                    p999_ms = self.write_interval_histogram.get_value_at_percentile(99.9) / 1000.0
+                    max_ms = self.write_interval_histogram.get_max_value() / 1000.0
+                else:
+                    mean_ms = self.read_interval_histogram.get_mean_value() / 1000.0
+                    median_ms = self.read_interval_histogram.get_value_at_percentile(50.0) / 1000.0
+                    p95_ms = self.read_interval_histogram.get_value_at_percentile(95.0) / 1000.0
+                    p99_ms = self.read_interval_histogram.get_value_at_percentile(99.0) / 1000.0
+                    p999_ms = self.read_interval_histogram.get_value_at_percentile(99.9) / 1000.0
+                    max_ms = self.read_interval_histogram.get_max_value() / 1000.0
+
+                # Reset interval histograms
+                self.write_interval_histogram.reset()
+                self.read_interval_histogram.reset()
 
             # Print header once
             if not self.stats_header_printed:
@@ -923,37 +1116,36 @@ class CassandraStressPy:
                 )
                 self.stats_header_printed = True
 
+            total_ops = self.total_write_ops + self.total_read_ops
+
             # Print interval stats
             print(
-                f"{self.total_ops:>10}, {ops_per_sec:>8.0f}, {mean_ms:>6.1f}, {median_ms:>7.1f}, "
+                f"{total_ops:>10}, {ops_per_sec:>8.0f}, {mean_ms:>6.1f}, {median_ms:>7.1f}, "
                 f"{p95_ms:>7.1f}, {p99_ms:>7.1f}, {p999_ms:>7.1f}, {max_ms:>7.1f}, "
                 f"{elapsed_time:>6.1f}, {self.interval_errors:>7}"
             )
 
             # Reset interval counters
-            self.interval_histogram.reset()
-            self.interval_ops = 0
+            self.write_interval_ops = 0
+            self.read_interval_ops = 0
             self.interval_errors = 0
             self.last_interval_time = elapsed_time
 
-    def print_summary(self, duration, ops):
-        op_type = self.config.command.upper()
+    def _print_op_summary(self, op_type, histogram, duration, ops):
+        """Print summary for a single operation type."""
         op_rate = ops / duration if duration > 0 else 0
 
         # Convert microseconds to milliseconds for display
-        latency_mean = self.histogram.get_mean_value() / 1000.0
-        latency_median = self.histogram.get_value_at_percentile(50.0) / 1000.0
-        latency_p95 = self.histogram.get_value_at_percentile(95.0) / 1000.0
-        latency_p99 = self.histogram.get_value_at_percentile(99.0) / 1000.0
-        latency_p999 = self.histogram.get_value_at_percentile(99.9) / 1000.0
-        latency_max = self.histogram.get_max_value() / 1000.0
+        if histogram.get_total_count() > 0:
+            latency_mean = histogram.get_mean_value() / 1000.0
+            latency_median = histogram.get_value_at_percentile(50.0) / 1000.0
+            latency_p95 = histogram.get_value_at_percentile(95.0) / 1000.0
+            latency_p99 = histogram.get_value_at_percentile(99.0) / 1000.0
+            latency_p999 = histogram.get_value_at_percentile(99.9) / 1000.0
+            latency_max = histogram.get_max_value() / 1000.0
+        else:
+            latency_mean = latency_median = latency_p95 = latency_p99 = latency_p999 = latency_max = 0.0
 
-        # Format duration as HH:MM:SS
-        hours, remainder = divmod(int(duration), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-        print("\nResults:")
         print(f"Op rate                   : {op_rate:,.0f} op/s  [{op_type}: {op_rate:,.0f} op/s]")
         print(f"Latency mean              :  {latency_mean:.1f} ms [{op_type}: {latency_mean:.1f} ms]")
         print(f"Latency median            :  {latency_median:.1f} ms [{op_type}: {latency_median:.1f} ms]")
@@ -961,6 +1153,90 @@ class CassandraStressPy:
         print(f"Latency 99th percentile   :  {latency_p99:.1f} ms [{op_type}: {latency_p99:.1f} ms]")
         print(f"Latency 99.9th percentile :  {latency_p999:.1f} ms [{op_type}: {latency_p999:.1f} ms]")
         print(f"Latency max               :  {latency_max:.1f} ms [{op_type}: {latency_max:.1f} ms]")
+
+    def _print_mixed_summary(self, duration):
+        """Print combined summary for mixed workload matching cassandra-stress format."""
+        total_ops = self.total_write_ops + self.total_read_ops
+        total_rate = total_ops / duration if duration > 0 else 0
+        write_rate = self.total_write_ops / duration if duration > 0 else 0
+        read_rate = self.total_read_ops / duration if duration > 0 else 0
+
+        # Get stats from both histograms
+        write_hist = self.write_summary_histogram
+        read_hist = self.read_summary_histogram
+        write_count = write_hist.get_total_count()
+        read_count = read_hist.get_total_count()
+
+        # Calculate individual latencies (in ms)
+        if write_count > 0:
+            write_mean = write_hist.get_mean_value() / 1000.0
+            write_median = write_hist.get_value_at_percentile(50.0) / 1000.0
+            write_p95 = write_hist.get_value_at_percentile(95.0) / 1000.0
+            write_p99 = write_hist.get_value_at_percentile(99.0) / 1000.0
+            write_p999 = write_hist.get_value_at_percentile(99.9) / 1000.0
+            write_max = write_hist.get_max_value() / 1000.0
+        else:
+            write_mean = write_median = write_p95 = write_p99 = write_p999 = write_max = 0.0
+
+        if read_count > 0:
+            read_mean = read_hist.get_mean_value() / 1000.0
+            read_median = read_hist.get_value_at_percentile(50.0) / 1000.0
+            read_p95 = read_hist.get_value_at_percentile(95.0) / 1000.0
+            read_p99 = read_hist.get_value_at_percentile(99.0) / 1000.0
+            read_p999 = read_hist.get_value_at_percentile(99.9) / 1000.0
+            read_max = read_hist.get_max_value() / 1000.0
+        else:
+            read_mean = read_median = read_p95 = read_p99 = read_p999 = read_max = 0.0
+
+        # Calculate combined latencies (weighted average)
+        if write_count + read_count > 0:
+            combined_mean = (write_mean * write_count + read_mean * read_count) / (write_count + read_count)
+            combined_median = (write_median * write_count + read_median * read_count) / (write_count + read_count)
+            combined_p95 = (write_p95 * write_count + read_p95 * read_count) / (write_count + read_count)
+            combined_p99 = (write_p99 * write_count + read_p99 * read_count) / (write_count + read_count)
+            combined_p999 = (write_p999 * write_count + read_p999 * read_count) / (write_count + read_count)
+            combined_max = max(write_max, read_max)
+        else:
+            combined_mean = combined_median = combined_p95 = combined_p99 = combined_p999 = combined_max = 0.0
+
+        # Print in cassandra-stress format
+        print(
+            f"Op rate                   : {total_rate:,.0f} op/s  [READ: {read_rate:,.0f} op/s, WRITE: {write_rate:,.0f} op/s]"
+        )
+        print(
+            f"Latency mean              :  {combined_mean:.1f} ms [READ: {read_mean:.1f} ms, WRITE: {write_mean:.1f} ms]"
+        )
+        print(
+            f"Latency median            :  {combined_median:.1f} ms [READ: {read_median:.1f} ms, WRITE: {write_median:.1f} ms]"
+        )
+        print(
+            f"Latency 95th percentile   :  {combined_p95:.1f} ms [READ: {read_p95:.1f} ms, WRITE: {write_p95:.1f} ms]"
+        )
+        print(
+            f"Latency 99th percentile   :  {combined_p99:.1f} ms [READ: {read_p99:.1f} ms, WRITE: {write_p99:.1f} ms]"
+        )
+        print(
+            f"Latency 99.9th percentile :  {combined_p999:.1f} ms [READ: {read_p999:.1f} ms, WRITE: {write_p999:.1f} ms]"
+        )
+        print(
+            f"Latency max               :  {combined_max:,.1f} ms [READ: {read_max:,.1f} ms, WRITE: {write_max:,.1f} ms]"
+        )
+
+    def print_summary(self, duration, ops):
+        # Format duration as HH:MM:SS
+        hours, remainder = divmod(int(duration), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+        print("\nResults:")
+
+        if self.config.command == "write":
+            self._print_op_summary("WRITE", self.write_summary_histogram, duration, self.total_write_ops)
+        elif self.config.command == "read":
+            self._print_op_summary("READ", self.read_summary_histogram, duration, self.total_read_ops)
+        else:  # mixed
+            self._print_mixed_summary(duration)
+
         print(f"Total operation time      : {duration_str}")
 
 

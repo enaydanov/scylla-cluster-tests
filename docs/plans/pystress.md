@@ -56,7 +56,7 @@
 ### 8. Cassandra-Stress Compatible Output Format
 - **Objective**: Match cassandra-stress output format for easy integration with existing tooling.
 - **Details**:
-  - **Summary output** matches cassandra-stress format:
+  - **Summary output for single operation type** (write or read):
     ```
     Results:
     Op rate                   : 125,468 op/s  [WRITE: 125,468 op/s]
@@ -67,6 +67,18 @@
     Latency 99.9th percentile :  6.7 ms [WRITE: 6.7 ms]
     Latency max               :  116.9 ms [WRITE: 116.9 ms]
     Total operation time      : 00:16:36
+    ```
+  - **Summary output for mixed workload** (combined stats with READ/WRITE breakdown):
+    ```
+    Results:
+    Op rate                   :   29,187 op/s  [READ: 14,594 op/s, WRITE: 14,594 op/s]
+    Latency mean              :    3.4 ms [READ: 4.8 ms, WRITE: 2.0 ms]
+    Latency median            :    2.1 ms [READ: 2.9 ms, WRITE: 1.5 ms]
+    Latency 95th percentile   :    9.1 ms [READ: 12.2 ms, WRITE: 3.9 ms]
+    Latency 99th percentile   :   20.9 ms [READ: 25.9 ms, WRITE: 6.8 ms]
+    Latency 99.9th percentile :   93.5 ms [READ: 182.8 ms, WRITE: 44.3 ms]
+    Latency max               : 5,041.6 ms [READ: 5,041.6 ms, WRITE: 2,043.7 ms]
+    Total operation time      : 12:00:00
     ```
   - **Periodic interval statistics** printed every N seconds (configurable via `-log interval=N`):
     ```
@@ -113,6 +125,56 @@
     - `-pop 'dist=GAUSSIAN(1..1000000,5)'` (stdvrng=5)
     - `-pop 'dist=gauss(1..1000000,500000,100000)'` (explicit mean=500000, stdev=100000)
 
+### 11. Cassandra-Stress Compatible HDR File Format
+- **Objective**: Generate HDR histogram files matching cassandra-stress format.
+- **Details**:
+  - Custom `TaggedHistogramLogWriter` class extends `HistogramLogWriter` to support tag output
+    - The standard library's `output_interval_histogram()` does not output tags
+    - Our subclass overrides this method to include `Tag=<tag>,` prefix when histogram has a tag
+  - Uses `HistogramLogWriter` methods for proper formatting:
+    - `output_comment()` for first comment line
+    - `output_log_format_version()` for version header (1.2 - Python library limitation)
+    - `output_base_time()` for BaseTime header
+    - `output_start_time()` for StartTime header
+    - `output_legend()` for CSV column header
+    - `output_interval_histogram()` (overridden) for histogram data with tag
+  - Header format:
+    ```
+    #Logging op latencies for Cassandra Stress
+    #[Histogram log format version 1.2]
+    #[BaseTime: 1768994585.000 (seconds since epoch)]
+    #[StartTime: 1768994585.000 (seconds since epoch), 2026-02-13 12:00:00]
+    "StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+    Tag=WRITE-st,0.000000,60.000000,999,<base64_histogram>
+    ```
+  - Tags for histogram records:
+    - `WRITE-st` for write operations
+    - `READ-st` for read operations
+    - The `-st` suffix means "service time" (request to response time)
+  - Note: `mixed` command outputs both `WRITE-st` and `READ-st` histograms
+  - Note: Format version 1.2 is a Python hdrhistogram library limitation (cassandra-stress uses 1.3)
+
+### 12. Separate Read/Write Histograms with Interval-Based HDR Output
+- **Objective**: Maintain separate histograms for READ and WRITE operations, output to HDR file periodically.
+- **Details**:
+  - Separate histogram tracking:
+    - `write_summary_histogram` / `read_summary_histogram` - Accumulated across all intervals for final summary
+    - `write_interval_histogram` / `read_interval_histogram` - Reset after each interval output
+  - HDR file initialization:
+    - File opened and headers written at start of run via `_init_hdr_writer()`
+    - Uses `TaggedHistogramLogWriter` for tag support
+  - Interval-based output:
+    - `_output_interval_histograms()` called every `log_interval` seconds
+    - Outputs `WRITE-st` histogram if write operations occurred in interval
+    - Outputs `READ-st` histogram if read operations occurred in interval
+    - Histograms reset after each interval output
+  - Mixed workload support:
+    - Randomly selects read or write for each operation (50/50 split)
+    - Both `WRITE-st` and `READ-st` histograms output in same interval
+  - Final summary:
+    - Prints separate statistics for READ and WRITE operations
+    - Uses accumulated summary histograms
+
 ---
 
 ## CLI Options Reference
@@ -137,4 +199,4 @@
 ---
 
 ## Summary
-The `pystress.py` tool is a versatile and lightweight benchmarking solution for ScyllaDB. By mimicking the `cassandra-stress` CLI interface and output format, it ensures ease of use and compatibility with existing tooling while providing advanced features such as HDR Histogram generation, flexible schema configurations, periodic interval statistics, and precise traffic control. This plan outlines the key steps and features implemented to achieve a robust and user-friendly tool.
+The `pystress.py` tool is a versatile and lightweight benchmarking solution for ScyllaDB. By mimicking the `cassandra-stress` CLI interface and output format, it ensures ease of use and compatibility with existing tooling while providing advanced features such as HDR Histogram generation, flexible schema configurations, periodic interval statistics, separate read/write histogram tracking, and precise traffic control. This plan outlines the key steps and features implemented to achieve a robust and user-friendly tool.
