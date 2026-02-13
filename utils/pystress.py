@@ -32,6 +32,7 @@ import random
 import threading
 import re
 from concurrent.futures import ThreadPoolExecutor
+from typing import TypedDict
 
 from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.policies import TokenAwarePolicy, DCAwareRoundRobinPolicy
@@ -43,6 +44,14 @@ from hdrh.log import HistogramLogWriter
 logger = logging.getLogger(__name__)
 
 TABLE_NAME = "standard1"
+
+
+class PopDistribution(TypedDict):
+    type: str
+    min: int
+    max: int
+    mean: int | float | None
+    stdev: int | float | None
 
 
 class StressConfig:
@@ -65,6 +74,8 @@ class StressConfig:
         self.pop_dist = "seq"
         self.pop_min = 1
         self.pop_max = 1000000
+        self.pop_mean = None
+        self.pop_stdev = None
         self.output_file = "pystress.hdr"
         self.user = None
         self.password = None
@@ -197,6 +208,78 @@ def parse_schema_option(schema_str):
     compression_match = re.search(r"compression\s*=\s*(\S+)", schema_str, re.IGNORECASE)
     if compression_match:
         result["compression"] = compression_match.group(1)
+
+    return result
+
+
+def parse_pop_distribution(pop_str) -> PopDistribution:
+    """
+    Parse cassandra-stress style population distribution.
+
+    Supported formats:
+        seq=min..max
+        dist=GAUSSIAN(min..max,stdvrng)
+        dist=GAUSSIAN(min..max,mean,stdev)
+        dist=UNIFORM(min..max)
+
+    Aliases: gauss, normal, norm (all map to GAUSSIAN)
+    Distribution names are case-insensitive.
+    """
+    result: PopDistribution = {
+        "type": "seq",
+        "min": 1,
+        "max": 1000000,
+        "mean": None,
+        "stdev": None,
+    }
+
+    # Parse seq=min..max
+    if "seq=" in pop_str.lower():
+        vals = re.findall(r"\d+", pop_str)
+        if len(vals) >= 2:
+            result["type"] = "seq"
+            result["min"] = int(vals[0])
+            result["max"] = int(vals[1])
+        return result
+
+    # Parse dist=DISTRIBUTION(...)
+    dist_match = re.search(r"dist\s*=\s*(\w+)\s*\(([^)]+)\)", pop_str, re.IGNORECASE)
+    if dist_match:
+        dist_name = dist_match.group(1).lower()
+        params = dist_match.group(2)
+
+        # Extract all numbers (handles min..max,param1,param2)
+        vals = re.findall(r"\d+", params)
+
+        if dist_name in ("gaussian", "gauss", "normal", "norm"):
+            result["type"] = "gaussian"
+            if len(vals) >= 2:
+                result["min"] = int(vals[0])
+                result["max"] = int(vals[1])
+                mean = (result["min"] + result["max"]) / 2
+
+                if len(vals) == 3:
+                    # GAUSSIAN(min..max,stdvrng) format
+                    stdvrng = float(vals[2])
+                    result["mean"] = mean
+                    if stdvrng > 0:
+                        result["stdev"] = (mean - result["min"]) / stdvrng
+                    else:
+                        result["stdev"] = (mean - result["min"]) / 3
+                elif len(vals) >= 4:
+                    # GAUSSIAN(min..max,mean,stdev) format
+                    result["mean"] = float(vals[2])
+                    result["stdev"] = float(vals[3])
+                else:
+                    # Default: stdvrng=3 (covers ~99.7% within range)
+                    result["mean"] = mean
+                    result["stdev"] = (mean - result["min"]) / 3
+
+        elif dist_name == "uniform":
+            result["type"] = "uniform"
+            if len(vals) >= 2:
+                result["min"] = int(vals[0])
+                result["max"] = int(vals[1])
 
     return result
 
@@ -334,21 +417,18 @@ def parse_cli_args(args):
 
         elif arg == "-pop":
             i += 1
-            if i < len(args):
-                pop_arg = args[i]
-                # Basic handling for seq=X..Y or dist=gauss(...)
-                if "seq=" in pop_arg:
-                    vals = re.findall(r"\d+", pop_arg)
-                    if len(vals) >= 2:
-                        config.pop_min = int(vals[0])
-                        config.pop_max = int(vals[1])
-                elif "dist=gauss" in pop_arg:
-                    # map gauss to random for this scaffold
-                    config.pop_dist = "random"
-                    vals = re.findall(r"\d+", pop_arg)
-                    if len(vals) >= 1:
-                        config.pop_max = int(vals[0])
-            i += 1
+            pop_parts = []
+            while i < len(args) and not args[i].startswith("-"):
+                pop_parts.append(args[i])
+                i += 1
+            if pop_parts:
+                pop_str = " ".join(pop_parts)
+                parsed = parse_pop_distribution(pop_str)
+                config.pop_dist = parsed["type"]
+                config.pop_min = parsed["min"]
+                config.pop_max = parsed["max"]
+                config.pop_mean = parsed["mean"]
+                config.pop_stdev = parsed["stdev"]
 
         elif arg == "-log":
             i += 1
@@ -430,8 +510,15 @@ FLAGS:
                             Example: -schema 'replication(strategy=NetworkTopologyStrategy replication_factor=3) compaction(strategy=LeveledCompactionStrategy)'
     -pop <options>          Population distribution
                             seq=<min>..<max>    Sequential range (default)
-                            dist=gauss(<mean>)  Gaussian distribution
-                            Example: -pop seq=1..1000000
+                            dist=UNIFORM(min..max)  Uniform random distribution
+                            dist=GAUSSIAN(min..max,stdvrng)  Gaussian distribution
+                                mean=(min+max)/2, stdev=(mean-min)/stdvrng
+                            dist=GAUSSIAN(min..max,mean,stdev)  Gaussian with explicit params
+                            Aliases: gauss, normal, norm (for GAUSSIAN)
+                            Example: -pop 'seq=1..1000000'
+                            Example: -pop 'dist=UNIFORM(1..1000000)'
+                            Example: -pop 'dist=GAUSSIAN(1..1000000,5)'
+                            Example: -pop 'dist=gauss(1..1000000,500000,100000)'
     -log <options>          Logging options
                             hdrfile=<path>      Output HDR histogram file (default: pystress.hdr)
                             interval=<time>     Interval for periodic stats output (default: 10)
@@ -624,24 +711,34 @@ class CassandraStressPy:
 
         start_time = time.perf_counter()
 
-        # Generator for keys
-        if self.config.pop_dist == "random":
+        # Generator for keys based on population distribution
+        if self.config.pop_dist == "gaussian":
+            mean = self.config.pop_mean
+            stdev = self.config.pop_stdev
 
             def key_gen():
-                idx = self.config.pop_min
                 while True:
-                    if self.config.pop_dist == "random":
-                        yield random.randint(self.config.pop_min, self.config.pop_max)
-                    else:
-                        yield idx
-                        idx += 1
+                    # Generate gaussian value and clamp to [min, max]
+                    val = random.gauss(mean, stdev)
+                    val = int(round(val))
+                    val = max(self.config.pop_min, min(self.config.pop_max, val))
+                    yield val
+
+        elif self.config.pop_dist == "uniform":
+
+            def key_gen():
+                while True:
+                    yield random.randint(self.config.pop_min, self.config.pop_max)
+
         else:
-            # Sequence
+            # Sequential (default)
             def key_gen():
                 idx = self.config.pop_min
                 while True:
                     yield idx
                     idx += 1
+                    if idx > self.config.pop_max:
+                        idx = self.config.pop_min  # wrap around
 
         keys = key_gen()
 
