@@ -94,6 +94,25 @@
     - `-schema 'replication(replication_factor=3) compaction(strategy=SizeTieredCompactionStrategy)'`
     - `-schema 'keyspace=mystress compaction(strategy=LeveledCompactionStrategy) compression=LZ4Compressor'`
 
+### 10. Add Support for `-pop dist=` Option (Population Distributions)
+- **Objective**: Support cassandra-stress style population distribution options.
+- **Details**:
+  - Supported distribution formats:
+    - `seq=min..max` - Sequential range (default)
+    - `dist=UNIFORM(min..max)` - Uniform random distribution
+    - `dist=GAUSSIAN(min..max,stdvrng)` - Gaussian distribution
+      - `mean = (min + max) / 2`
+      - `stdev = (mean - min) / stdvrng`
+    - `dist=GAUSSIAN(min..max,mean,stdev)` - Gaussian with explicit parameters
+  - Aliases: `gauss`, `normal`, `norm` (all map to GAUSSIAN)
+  - Distribution names are case-insensitive
+  - Gaussian values are clamped to [min, max] range
+  - Examples:
+    - `-pop 'seq=1..1000000'`
+    - `-pop 'dist=UNIFORM(1..1000000)'`
+    - `-pop 'dist=GAUSSIAN(1..1000000,5)'` (stdvrng=5)
+    - `-pop 'dist=gauss(1..1000000,500000,100000)'` (explicit mean=500000, stdev=100000)
+
 ---
 
 ## CLI Options Reference
@@ -111,8 +130,8 @@
 | `-rate` | Rate limiting options | `-rate threads=10 throttle=1000/s` |
 | `-col` | Column configuration | `-col 'size=FIXED(1024) n=FIXED(5)'` |
 | `-log` | Logging options | `-log hdrfile=output.hdr interval=30s` |
-| `-schema` | Schema options (keyspace, replication) | `-schema 'keyspace=mystress replication_factor=3'` |
-| `-pop` | Population distribution | `-pop 'seq=1..1000000'` |
+| `-schema` | Schema options (keyspace, replication, compaction) | `-schema 'replication(replication_factor=3) keyspace=test'` |
+| `-pop` | Population distribution | `-pop 'dist=GAUSSIAN(1..1000000,5)'` |
 | `--help` | Show help message | `pystress.py --help` |
 
 ---
