@@ -169,11 +169,24 @@
     - Outputs `READ-st` histogram if read operations occurred in interval
     - Histograms reset after each interval output
   - Mixed workload support:
-    - Randomly selects read or write for each operation (50/50 split)
+    - Selects read or write based on configured ratio (default: 50/50)
     - Both `WRITE-st` and `READ-st` histograms output in same interval
   - Final summary:
     - Prints separate statistics for READ and WRITE operations
     - Uses accumulated summary histograms
+
+### 13. Add Support for `ratio(write=N,read=M)` Option
+- **Objective**: Allow configuring the read/write ratio for mixed workloads.
+- **Details**:
+  - Parse `ratio(write=N,read=M)` syntax after `mixed` command
+  - Default ratio is 1:1 (50% writes, 50% reads)
+  - Ratio determines probability of selecting write vs read operation
+  - Order of write/read in ratio string doesn't matter
+  - Case-insensitive parsing
+  - Examples:
+    - `mixed 'ratio(write=1,read=1)'` - 50% writes, 50% reads (default)
+    - `mixed 'ratio(write=1,read=2)'` - 33% writes, 67% reads
+    - `mixed 'ratio(read=3,write=1)'` - 25% writes, 75% reads
 
 ---
 
@@ -183,7 +196,7 @@
 |--------|-------------|---------|
 | `write` | Write workload | `pystress.py write n=10000` |
 | `read` | Read workload | `pystress.py read n=10000` |
-| `mixed` | Mixed read/write workload | `pystress.py mixed n=10000` |
+| `mixed` | Mixed read/write workload with optional ratio | `pystress.py mixed 'ratio(write=1,read=2)' n=10000` |
 | `n=<num>` | Number of operations | `n=1000000` |
 | `duration=<time>` | Test duration (e.g., `30s`, `5m`, `1h`) | `duration=5m` |
 | `cl=<level>` | Consistency level | `cl=QUORUM` |
@@ -199,4 +212,4 @@
 ---
 
 ## Summary
-The `pystress.py` tool is a versatile and lightweight benchmarking solution for ScyllaDB. By mimicking the `cassandra-stress` CLI interface and output format, it ensures ease of use and compatibility with existing tooling while providing advanced features such as HDR Histogram generation, flexible schema configurations, periodic interval statistics, separate read/write histogram tracking, and precise traffic control. This plan outlines the key steps and features implemented to achieve a robust and user-friendly tool.
+The `pystress.py` tool is a versatile and lightweight benchmarking solution for ScyllaDB. By mimicking the `cassandra-stress` CLI interface and output format, it ensures ease of use and compatibility with existing tooling while providing advanced features such as HDR Histogram generation, flexible schema configurations, periodic interval statistics, separate read/write histogram tracking, configurable read/write ratios, and precise traffic control. This plan outlines the key steps and features implemented to achieve a robust and user-friendly tool.
