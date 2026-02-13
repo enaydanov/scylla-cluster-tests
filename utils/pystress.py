@@ -141,6 +141,8 @@ class StressConfig:
         self.duration = None
         self.throttle = None
         self.log_interval = 10  # Default interval for periodic stats (seconds)
+        self.ratio_write = 1  # Write ratio for mixed workload
+        self.ratio_read = 1  # Read ratio for mixed workload
 
 
 def parse_metric_suffix(val_str):
@@ -342,6 +344,34 @@ def parse_pop_distribution(pop_str) -> PopDistribution:
     return result
 
 
+def parse_ratio_option(ratio_str):
+    """
+    Parse cassandra-stress style ratio option for mixed workloads.
+
+    Format: ratio(write=N,read=M) or ratio(read=M,write=N)
+
+    Examples:
+        "ratio(write=1,read=1)"  -> write=1, read=1 (50/50)
+        "ratio(write=1,read=2)"  -> write=1, read=2 (33/67)
+        "ratio(read=3,write=1)"  -> write=1, read=3 (25/75)
+    """
+    result = {"write": 1, "read": 1}
+
+    ratio_match = re.search(r"ratio\s*\(([^)]+)\)", ratio_str, re.IGNORECASE)
+    if ratio_match:
+        content = ratio_match.group(1)
+
+        write_match = re.search(r"write\s*=\s*(\d+)", content, re.IGNORECASE)
+        if write_match:
+            result["write"] = int(write_match.group(1))
+
+        read_match = re.search(r"read\s*=\s*(\d+)", content, re.IGNORECASE)
+        if read_match:
+            result["read"] = int(read_match.group(1))
+
+    return result
+
+
 def parse_cli_args(args):
     """
     Parses cassandra-stress style arguments manually since argparse
@@ -363,6 +393,14 @@ def parse_cli_args(args):
         sys.exit(1)
 
     i = 1
+
+    # Check for ratio option immediately after mixed command (e.g., mixed 'ratio(write=1,read=2)')
+    if config.command == "mixed" and i < len(args) and "ratio(" in args[i].lower():
+        parsed_ratio = parse_ratio_option(args[i])
+        config.ratio_write = parsed_ratio["write"]
+        config.ratio_read = parsed_ratio["read"]
+        i += 1
+
     while i < len(args):
         arg = args[i]
 
@@ -534,7 +572,9 @@ USAGE:
 COMMANDS:
     write       Perform write operations
     read        Perform read operations
-    mixed       Perform mixed operations (stub)
+    mixed       Perform mixed read/write operations
+                ratio(write=N,read=M)  Ratio of operations (default: 1:1)
+                Example: mixed 'ratio(write=1,read=2)'  (33% writes, 67% reads)
 
 POSITIONAL ARGUMENTS (key=value):
     n=<number>              Number of operations (default: 10000)
@@ -938,9 +978,10 @@ class CassandraStressPy:
 
                 idx = pick_session_index()
 
-                # For mixed workload, randomly choose read or write
+                # For mixed workload, select based on configured ratio
                 if op_type == "mixed":
-                    if random.random() < 0.5:
+                    total_ratio = self.config.ratio_write + self.config.ratio_read
+                    if random.random() < (self.config.ratio_write / total_ratio):
                         current_op_type = "write"
                         current_task = do_write
                     else:
