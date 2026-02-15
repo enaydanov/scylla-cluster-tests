@@ -175,6 +175,19 @@
     - Prints separate statistics for READ and WRITE operations
     - Uses accumulated summary histograms
 
+### 14. Nanosecond Latency Storage (cassandra-stress compatibility)
+- **Objective**: Store latency values in nanoseconds to match cassandra-stress implementation.
+- **Details**:
+  - Latency values captured using `time.perf_counter()` and converted to nanoseconds
+  - Histogram configuration: `HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)` (1ns to 1 hour, 3 sig figs)
+  - Recording: `int((time.perf_counter() - t0) * 1_000_000_000)` nanoseconds
+  - Display conversion: `value / 1_000_000.0` (ns → ms) for console output
+  - HDR output: `max_value_unit_ratio=1000000000.0` (ns → seconds) for file output
+  - Benefits:
+    - Exact compatibility with cassandra-stress histogram semantics
+    - Higher precision for sub-microsecond latencies
+    - Easier comparison when analyzing HDR files from both tools
+
 ### 13. Add Support for `ratio(write=N,read=M)` Option
 - **Objective**: Allow configuring the read/write ratio for mixed workloads.
 - **Details**:

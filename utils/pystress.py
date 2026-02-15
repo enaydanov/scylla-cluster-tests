@@ -65,7 +65,7 @@ class TaggedHistogramLogWriter(HistogramLogWriter):
         self.log.write(f"#[StartTime: {start_time_sec} (seconds since epoch), {datetime_formatted}]\n")
 
     def output_interval_histogram(
-        self, histogram, start_time_stamp_sec=0, end_time_stamp_sec=0, max_value_unit_ratio=1000000.0
+        self, histogram, start_time_stamp_sec=0, end_time_stamp_sec=0, max_value_unit_ratio=1000000000.0
     ):
         """Output an interval histogram with optional tag support.
 
@@ -659,14 +659,14 @@ class CassandraStressPy:
         self.prepared_reads = []
         self.histogram_lock = threading.Lock()
 
-        # Separate histograms for READ and WRITE operations (1 microsec to 1 hour, 3 sig figs)
+        # Separate histograms for READ and WRITE operations (1 nanosec to 1 hour, 3 sig figs)
         # Summary histograms - accumulated across all intervals for final summary
-        self.write_summary_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
-        self.read_summary_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
+        self.write_summary_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
+        self.read_summary_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
 
         # Interval histograms - reset after each interval output
-        self.write_interval_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
-        self.read_interval_histogram = HdrHistogram(1, 60 * 60 * 1000 * 1000, 3)
+        self.write_interval_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
+        self.read_interval_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
 
         # Interval statistics tracking
         self.write_interval_ops = 0
@@ -885,14 +885,14 @@ class CassandraStressPy:
             # Helper to process result with operation type
             def on_done(f, op_type):
                 try:
-                    latency_micros = f.result()
+                    latency_nanos = f.result()
                     with self.histogram_lock:
                         if op_type == "write":
-                            self.write_summary_histogram.record_value(latency_micros)
-                            self.write_interval_histogram.record_value(latency_micros)
+                            self.write_summary_histogram.record_value(latency_nanos)
+                            self.write_interval_histogram.record_value(latency_nanos)
                         else:
-                            self.read_summary_histogram.record_value(latency_micros)
-                            self.read_interval_histogram.record_value(latency_micros)
+                            self.read_summary_histogram.record_value(latency_nanos)
+                            self.read_interval_histogram.record_value(latency_nanos)
                     with self.stats_lock:
                         if op_type == "write":
                             self.write_interval_ops += 1
@@ -925,14 +925,14 @@ class CassandraStressPy:
 
                 t0 = time.perf_counter()
                 self.sessions[session_idx].execute(self.prepared_writes[session_idx], args)
-                return int((time.perf_counter() - t0) * 1_000_000)
+                return int((time.perf_counter() - t0) * 1_000_000_000)  # nanoseconds
 
             def do_read(key_int, session_idx):
                 args = (self._generate_key(key_int),)
 
                 t0 = time.perf_counter()
                 self.sessions[session_idx].execute(self.prepared_reads[session_idx], args)
-                return int((time.perf_counter() - t0) * 1_000_000)
+                return int((time.perf_counter() - t0) * 1_000_000_000)  # nanoseconds
 
             # Determine operation type for callbacks
             if self.config.command == "write":
@@ -1112,38 +1112,38 @@ class CassandraStressPy:
                             + self.read_interval_histogram.get_mean_value() * read_count
                         )
                         / total_count
-                        / 1000.0
+                        / 1_000_000.0
                     )
                     # For percentiles, use the histogram with more samples (approximate)
                     if write_count >= read_count:
                         hist = self.write_interval_histogram
                     else:
                         hist = self.read_interval_histogram
-                    median_ms = hist.get_value_at_percentile(50.0) / 1000.0
-                    p95_ms = hist.get_value_at_percentile(95.0) / 1000.0
-                    p99_ms = hist.get_value_at_percentile(99.0) / 1000.0
-                    p999_ms = hist.get_value_at_percentile(99.9) / 1000.0
+                    median_ms = hist.get_value_at_percentile(50.0) / 1_000_000.0
+                    p95_ms = hist.get_value_at_percentile(95.0) / 1_000_000.0
+                    p99_ms = hist.get_value_at_percentile(99.0) / 1_000_000.0
+                    p999_ms = hist.get_value_at_percentile(99.9) / 1_000_000.0
                     max_ms = (
                         max(
                             self.write_interval_histogram.get_max_value(),
                             self.read_interval_histogram.get_max_value(),
                         )
-                        / 1000.0
+                        / 1_000_000.0
                     )
                 elif write_count > 0:
-                    mean_ms = self.write_interval_histogram.get_mean_value() / 1000.0
-                    median_ms = self.write_interval_histogram.get_value_at_percentile(50.0) / 1000.0
-                    p95_ms = self.write_interval_histogram.get_value_at_percentile(95.0) / 1000.0
-                    p99_ms = self.write_interval_histogram.get_value_at_percentile(99.0) / 1000.0
-                    p999_ms = self.write_interval_histogram.get_value_at_percentile(99.9) / 1000.0
-                    max_ms = self.write_interval_histogram.get_max_value() / 1000.0
+                    mean_ms = self.write_interval_histogram.get_mean_value() / 1_000_000.0
+                    median_ms = self.write_interval_histogram.get_value_at_percentile(50.0) / 1_000_000.0
+                    p95_ms = self.write_interval_histogram.get_value_at_percentile(95.0) / 1_000_000.0
+                    p99_ms = self.write_interval_histogram.get_value_at_percentile(99.0) / 1_000_000.0
+                    p999_ms = self.write_interval_histogram.get_value_at_percentile(99.9) / 1_000_000.0
+                    max_ms = self.write_interval_histogram.get_max_value() / 1_000_000.0
                 else:
-                    mean_ms = self.read_interval_histogram.get_mean_value() / 1000.0
-                    median_ms = self.read_interval_histogram.get_value_at_percentile(50.0) / 1000.0
-                    p95_ms = self.read_interval_histogram.get_value_at_percentile(95.0) / 1000.0
-                    p99_ms = self.read_interval_histogram.get_value_at_percentile(99.0) / 1000.0
-                    p999_ms = self.read_interval_histogram.get_value_at_percentile(99.9) / 1000.0
-                    max_ms = self.read_interval_histogram.get_max_value() / 1000.0
+                    mean_ms = self.read_interval_histogram.get_mean_value() / 1_000_000.0
+                    median_ms = self.read_interval_histogram.get_value_at_percentile(50.0) / 1_000_000.0
+                    p95_ms = self.read_interval_histogram.get_value_at_percentile(95.0) / 1_000_000.0
+                    p99_ms = self.read_interval_histogram.get_value_at_percentile(99.0) / 1_000_000.0
+                    p999_ms = self.read_interval_histogram.get_value_at_percentile(99.9) / 1_000_000.0
+                    max_ms = self.read_interval_histogram.get_max_value() / 1_000_000.0
 
                 # Reset interval histograms
                 self.write_interval_histogram.reset()
@@ -1176,14 +1176,14 @@ class CassandraStressPy:
         """Print summary for a single operation type."""
         op_rate = ops / duration if duration > 0 else 0
 
-        # Convert microseconds to milliseconds for display
+        # Convert nanoseconds to milliseconds for display
         if histogram.get_total_count() > 0:
-            latency_mean = histogram.get_mean_value() / 1000.0
-            latency_median = histogram.get_value_at_percentile(50.0) / 1000.0
-            latency_p95 = histogram.get_value_at_percentile(95.0) / 1000.0
-            latency_p99 = histogram.get_value_at_percentile(99.0) / 1000.0
-            latency_p999 = histogram.get_value_at_percentile(99.9) / 1000.0
-            latency_max = histogram.get_max_value() / 1000.0
+            latency_mean = histogram.get_mean_value() / 1_000_000.0
+            latency_median = histogram.get_value_at_percentile(50.0) / 1_000_000.0
+            latency_p95 = histogram.get_value_at_percentile(95.0) / 1_000_000.0
+            latency_p99 = histogram.get_value_at_percentile(99.0) / 1_000_000.0
+            latency_p999 = histogram.get_value_at_percentile(99.9) / 1_000_000.0
+            latency_max = histogram.get_max_value() / 1_000_000.0
         else:
             latency_mean = latency_median = latency_p95 = latency_p99 = latency_p999 = latency_max = 0.0
 
@@ -1208,24 +1208,24 @@ class CassandraStressPy:
         write_count = write_hist.get_total_count()
         read_count = read_hist.get_total_count()
 
-        # Calculate individual latencies (in ms)
+        # Calculate individual latencies (in ms, converting from nanoseconds)
         if write_count > 0:
-            write_mean = write_hist.get_mean_value() / 1000.0
-            write_median = write_hist.get_value_at_percentile(50.0) / 1000.0
-            write_p95 = write_hist.get_value_at_percentile(95.0) / 1000.0
-            write_p99 = write_hist.get_value_at_percentile(99.0) / 1000.0
-            write_p999 = write_hist.get_value_at_percentile(99.9) / 1000.0
-            write_max = write_hist.get_max_value() / 1000.0
+            write_mean = write_hist.get_mean_value() / 1_000_000.0
+            write_median = write_hist.get_value_at_percentile(50.0) / 1_000_000.0
+            write_p95 = write_hist.get_value_at_percentile(95.0) / 1_000_000.0
+            write_p99 = write_hist.get_value_at_percentile(99.0) / 1_000_000.0
+            write_p999 = write_hist.get_value_at_percentile(99.9) / 1_000_000.0
+            write_max = write_hist.get_max_value() / 1_000_000.0
         else:
             write_mean = write_median = write_p95 = write_p99 = write_p999 = write_max = 0.0
 
         if read_count > 0:
-            read_mean = read_hist.get_mean_value() / 1000.0
-            read_median = read_hist.get_value_at_percentile(50.0) / 1000.0
-            read_p95 = read_hist.get_value_at_percentile(95.0) / 1000.0
-            read_p99 = read_hist.get_value_at_percentile(99.0) / 1000.0
-            read_p999 = read_hist.get_value_at_percentile(99.9) / 1000.0
-            read_max = read_hist.get_max_value() / 1000.0
+            read_mean = read_hist.get_mean_value() / 1_000_000.0
+            read_median = read_hist.get_value_at_percentile(50.0) / 1_000_000.0
+            read_p95 = read_hist.get_value_at_percentile(95.0) / 1_000_000.0
+            read_p99 = read_hist.get_value_at_percentile(99.0) / 1_000_000.0
+            read_p999 = read_hist.get_value_at_percentile(99.9) / 1_000_000.0
+            read_max = read_hist.get_max_value() / 1_000_000.0
         else:
             read_mean = read_median = read_p95 = read_p99 = read_p999 = read_max = 0.0
 
