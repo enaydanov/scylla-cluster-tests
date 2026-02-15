@@ -17,9 +17,8 @@
 ### 2. Add Support for `-mode` CLI Option
 - **Objective**: Implement the `-mode` option to configure connection settings.
 - **Details**:
-  - Parse `connectionsPerHost` and other parameters.
-  - Use multiple `Cluster`/`Session` instances to simulate multiple connections per host.
-  - Document how `connectionsPerHost` maps to multiple clusters/sessions.
+  - Parse `user` and `password` for authentication.
+  - Use `PlainTextAuthProvider` when credentials are provided.
 
 ### 3. Add Support for `-col` CLI Option
 - **Objective**: Implement column configuration options such as `size=FIXED(1024)` and `n=FIXED(1)`.
@@ -32,11 +31,21 @@
 - **Details**:
   - Use `time.perf_counter()` for accurate time measurement.
   - Ensure compatibility with other workload parameters.
+  - **Duration vs n=X behavior**:
+    - `duration=X`: Test stops immediately when time expires. Pending operations are cancelled.
+    - `n=X`: Test waits for all N operations to complete before stopping.
+  - **Implementation**:
+    - `stop_event` (multiprocessing.Event) signals immediate stop to workers
+    - Workers check `stop_event` in their loop and exit within ~100ms
+    - `executor.shutdown(wait=False, cancel_futures=True)` cancels pending tasks
+  - **Timing accuracy**: Total operation time should be within ~1s of requested duration.
 
 ### 5. Add Support for `-rate` CLI Option
-- **Objective**: Implement rate limiting for operations.
+- **Objective**: Implement rate limiting and concurrency control.
 - **Details**:
-  - Support `N/s` syntax for throttling (e.g., `throttle=1000/s`).
+  - `threads=N`: Number of concurrent threads per worker process.
+  - `processes=N`: Number of worker processes (replaces old `connectionsPerHost`).
+  - `throttle=N/s`: Support `N/s` syntax for throttling (e.g., `throttle=1000/s`).
 
 ### 6. Add Support for `-log` CLI Option
 - **Objective**: Enable users to specify HDR Histogram output files and interval statistics.
@@ -87,6 +96,8 @@
        3292404,  184906,   1.1,     0.9,     2.3,     3.0,     7.8,    15.5,   20.0        0
        4924818,  163241,   1.2,     1.0,     2.4,     3.1,     8.8,    99.8,   30.0        0
     ```
+  - **Strict interval timing**: The `time` column uses target interval boundaries (10.0, 20.0, 30.0)
+    rather than actual print time, preventing drift from processing overhead.
   - Latencies displayed in milliseconds for consistency with cassandra-stress.
   - Duration formatted as `HH:MM:SS`.
 
@@ -212,21 +223,80 @@
     - `_parse_pop_args()` - handles `-pop` flag
     - `_parse_log_args()` - handles `-log` flag
     - `_parse_mode_arg()` - handles `-mode` flag options
-  - **Workload Execution** - Separated concerns:
+  - **Multiprocess Execution** (always used):
+    - `ThreadConnection` - per-thread connection state (Cluster, Session, prepared statements)
+    - `WorkerContext` - class holding worker state with thread-local connections
+    - `worker_process()` - standalone function spawned as subprocess
+    - `StatsCollectorContext` - class holding stats aggregation state
+    - `stats_collector_process()` - standalone function for stats collection
+    - `ProcessPoolManager` - manages worker and stats collector lifecycle and IPC
+    - `run()` - main entry point, contains workload execution logic (inlined)
     - `_create_key_generator()` - creates key generator based on distribution config
-    - `_run_workload()` - orchestrates workload execution
-    - `_execute_operations()` - inner operation submission loop
-    - `_record_latency()` - records latency to histograms
-    - `_record_error()` - records operation errors
   - **Statistics and Output**:
     - `_get_histogram_stats()` - extracts stats from histogram as dict
     - `_print_op_summary()` - prints single operation type summary
     - `_print_mixed_summary()` - prints mixed workload summary
-    - `print_interval_stats()` - prints periodic interval statistics
+    - `print_interval_stats()` - prints periodic interval statistics (in StatsCollectorContext)
   - **Error Handling** - Specific exception types instead of blind catches:
     - `OSError` for file/network operations
     - `RuntimeError` for execution failures
     - `ValueError` for data conversion issues
+    - `ConnectionError` for connection failures (in workers)
+
+### 17. Multiprocess Mode
+- **Objective**: Use separate processes for true parallelism and decouple stats processing.
+- **Details**:
+  - **Always enabled** - single execution path for simplicity
+  - **Per-Thread Connections**:
+    - Each thread in a worker process has its own ScyllaDB Cluster/Session
+    - Connections are created upfront via `connect_all()` before workload starts
+    - Uses thread index assignment for O(1) connection lookup
+    - Total connections = `processes * threads`
+    - No latency impact from connection initialization during workload
+  - **Worker Processes**:
+    - Coordinate per-thread connections via `WorkerContext` and `ThreadConnection`
+    - Report histograms to stats collector via IPC queue
+    - Run ThreadPoolExecutor for concurrent operations
+    - Check `stop_event` for immediate termination (duration mode)
+  - **Stats Collector Process**:
+    - Receives histograms from all workers
+    - Aggregates results into summary and interval histograms
+    - Prints periodic interval statistics with strict timing
+    - Writes HDR histogram file
+    - Ensures main loop is not blocked by heavy stats processing
+  - **Main Process**:
+    - Coordinates task distribution via `ProcessPoolManager`
+    - Submits operations to workers via bounded queues
+    - Handles backpressure and shutdown sequences
+    - Sets `stop_event` for immediate stop (duration mode)
+  - **Shutdown behavior**:
+    - Duration mode (`duration=X`): Sets `stop_event`, workers exit immediately, cancel pending tasks
+    - Fixed ops mode (`n=X`):
+      1. Main process waits for ops_queue to drain (all operations picked up by workers)
+      2. Sends "graceful" signal, workers wait for pending ops to complete
+    - Workers send "done" signal BEFORE `cluster.shutdown()` to avoid blocking stats collector
+    - After joining all workers, main process sends "all_joined" signal to stats collector
+    - Stats collector exits when all "done" messages received OR "all_joined" signal received
+    - Stats collector is joined in `get_summary()`, not in `stop_workers()` (avoids premature termination)
+  - Implementation classes/functions:
+    - `WorkerContext` - holds worker state (connection, histograms, counters)
+    - `worker_process()` - standalone function spawned as subprocess, accepts `stop_event`
+    - `StatsCollectorContext` - holds aggregation and printing state
+    - `stats_collector_process()` - standalone function for stats collection
+    - `ProcessPoolManager` - manages worker and stats collector lifecycle, holds `stop_event`
+    - `run()` - main entry point, contains multiprocess workload execution logic (inlined)
+  - Message protocol:
+    - **Results Queue** (Workers → Stats Collector): `("histogram", ...)`, `("done", ...)`, `("error", ...)`
+    - **Results Queue** (Main → Stats Collector): `("all_joined", ...)` - signals all workers have been joined
+    - **Summary Queue** (Stats Collector → Main): `{"total_ops": ..., "latency_hist": ...}`
+  - Example:
+    ```bash
+    # Uses 4 worker processes + 1 stats collector process
+    pystress.py write n=100000 -rate threads=40 processes=4
+
+    # Duration mode - stops immediately at 15s
+    pystress.py write duration=15s -rate threads=40 processes=4
+    ```
 
 ---
 
@@ -241,8 +311,8 @@
 | `duration=<time>` | Test duration (e.g., `30s`, `5m`, `1h`) | `duration=5m` |
 | `cl=<level>` | Consistency level | `cl=QUORUM` |
 | `-node <hosts>` | Comma-separated list of nodes | `-node 10.0.0.1,10.0.0.2` |
-| `-mode` | Connection mode options | `-mode connectionsPerHost=5` |
-| `-rate` | Rate limiting options | `-rate threads=10 throttle=1000/s` |
+| `-mode` | Connection mode options | `-mode user=cassandra password=secret` |
+| `-rate` | Rate limiting options | `-rate threads=10 processes=4 throttle=1000/s` |
 | `-col` | Column configuration | `-col 'size=FIXED(1024) n=FIXED(5)'` |
 | `-log` | Logging options | `-log hdrfile=output.hdr interval=30s` |
 | `-schema` | Schema options (keyspace, replication, compaction) | `-schema 'replication(replication_factor=3) keyspace=test'` |
@@ -252,4 +322,4 @@
 ---
 
 ## Summary
-The `pystress.py` tool is a versatile and lightweight benchmarking solution for ScyllaDB. By mimicking the `cassandra-stress` CLI interface and output format, it ensures ease of use and compatibility with existing tooling while providing advanced features such as HDR Histogram generation, flexible schema configurations, periodic interval statistics, separate read/write histogram tracking, configurable read/write ratios, and precise traffic control. This plan outlines the key steps and features implemented to achieve a robust and user-friendly tool.
+The `pystress.py` tool is a versatile and lightweight benchmarking solution for ScyllaDB. By mimicking the `cassandra-stress` CLI interface and output format, it ensures ease of use and compatibility with existing tooling while providing advanced features such as HDR Histogram generation, flexible schema configurations, periodic interval statistics with strict timing, separate read/write histogram tracking, configurable read/write ratios, multiprocess execution for true parallelism, accurate duration enforcement via stop_event signaling, and precise traffic control. This plan outlines the key steps and features implemented to achieve a robust and user-friendly tool.

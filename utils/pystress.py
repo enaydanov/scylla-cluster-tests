@@ -20,8 +20,9 @@ Usage:
     ./pystress.py write n=100000 cl=QUORUM -rate threads=50 -node 192.168.1.10
 
 Note:
-    connectionsPerHost is implemented by creating multiple Cluster/Session instances and round-robin
-    dispatching operations across them in this driver.
+    The processes option (-rate processes=N) spawns multiple worker processes for true parallelism.
+    Each process has per-thread Cluster/Session connections, bypassing Python's GIL.
+    Total connections = processes * threads (e.g., processes=4 threads=10 = 40 connections).
     duration= supports suffixes s (seconds), m (minutes), h (hours), e.g., duration=5m.
 """
 
@@ -31,6 +32,9 @@ import logging
 import random
 import threading
 import re
+import multiprocessing
+import multiprocessing.synchronize
+import queue
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 from datetime import datetime
@@ -38,7 +42,7 @@ from datetime import datetime
 from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.policies import TokenAwarePolicy, DCAwareRoundRobinPolicy
 from cassandra.auth import PlainTextAuthProvider
-from cassandra import ConsistencyLevel
+from cassandra import ConsistencyLevel, consistency_value_to_name
 from hdrh.histogram import HdrHistogram
 from hdrh.log import HistogramLogWriter
 
@@ -122,8 +126,6 @@ class StressConfig:
         self.col_size = 1024
         self.col_count = 1
         # Distributions
-        self.col_size_dist = {"type": "FIXED", "value": 1024}
-        self.col_count_dist = {"type": "FIXED", "value": 1}
         self.nodes = ["127.0.0.1"]
         self.replication_factor = 1
         self.replication_strategy = "SimpleStrategy"
@@ -138,12 +140,16 @@ class StressConfig:
         self.output_file = "pystress.hdr"
         self.user = None
         self.password = None
-        self.connections_per_host = None
+        self.processes = 1
         self.duration = None
         self.throttle = None
         self.log_interval = 10  # Default interval for periodic stats (seconds)
         self.ratio_write = 1  # Write ratio for mixed workload
         self.ratio_read = 1  # Read ratio for mixed workload
+
+    @property
+    def threads_per_worker(self):
+        return max(1, self.threads // self.processes)
 
 
 def parse_metric_suffix(val_str):
@@ -395,6 +401,8 @@ def _parse_rate_args(config, args, start_idx):
         for part in parts:
             if "threads=" in part:
                 config.threads = int(part.split("=")[1])
+            elif "processes=" in part:
+                config.processes = int(part.split("=")[1])
             elif "throttle=" in part:
                 val = part.split("=")[1]
                 if val.endswith("/s"):
@@ -415,7 +423,6 @@ def _parse_col_args(config, args, start_idx):
                 _, val = part.split("size=", 1)
                 dist = parse_distribution(val)
                 if dist:
-                    config.col_size_dist = dist
                     if dist["type"] == "FIXED":
                         config.col_size = dist["value"]
                     elif dist["type"] == "UNIFORM":
@@ -424,7 +431,6 @@ def _parse_col_args(config, args, start_idx):
                 _, val = part.split("n=", 1)
                 dist = parse_distribution(val)
                 if dist:
-                    config.col_count_dist = dist
                     if dist["type"] == "FIXED":
                         config.col_count = dist["value"]
                     elif dist["type"] == "UNIFORM":
@@ -556,8 +562,6 @@ def _parse_mode_arg(config, mode_arg):
         config.user = mode_arg.split("=", 1)[1]
     elif "password=" in mode_arg:
         config.password = mode_arg.split("=", 1)[1]
-    elif "connectionsPerHost=" in mode_arg:
-        config.connections_per_host = int(mode_arg.split("=", 1)[1])
 
 
 def print_help():
@@ -585,10 +589,11 @@ POSITIONAL ARGUMENTS (key=value):
                             Options: ONE, QUORUM, LOCAL_QUORUM, etc.
 
 FLAGS:
-    -rate <options>         Rate control options
+    -rate <options>         Rate and parallelism options
                             threads=<number>    Number of threads (default: 1)
+                            processes=<number>  Number of worker processes (default: 1)
                             throttle=<number>/s Operation rate limit (ops/sec)
-                            Example: -rate threads=50,throttle=1000/s
+                            Example: -rate threads=50 processes=4 throttle=1000/s
     -node <nodes>           Comma-separated list of node IPs (default: 127.0.0.1)
                             Example: -node 192.168.1.10,192.168.1.11
     -col <options>          Column specification
@@ -624,8 +629,7 @@ FLAGS:
     -mode <options>         Connection mode options
                             user=<username>     Authentication username
                             password=<password> Authentication password
-                            connectionsPerHost=<number> Multiple connections per host
-                            Example: -mode user=cassandra password=cassandra connectionsPerHost=5
+                            Example: -mode user=cassandra password=cassandra
     -h, --help              Show this help message
 
 EXAMPLES:
@@ -642,23 +646,323 @@ EXAMPLES:
         ./pystress.py mixed n=100000 -mode user=cassandra password=secret -node 10.0.0.1,10.0.0.2
 
 NOTES:
-    - connectionsPerHost creates multiple Cluster/Session instances for load distribution.
+    - processes creates multiple worker processes, each with per-thread Cluster/Session connections.
+    - Each thread within a worker process has its own independent ScyllaDB connection.
+    - Total connections = processes * threads (e.g., 4 * 10 = 40 connections).
     - Throttle format must be <number>/s (e.g., 1000/s).
     - HDR histogram is saved to the specified file for latency analysis.
 """
     print(help_text)
 
 
-class CassandraStressPy:
-    def __init__(self, config):
-        self.config = config
-        self.clusters = []
-        self.sessions = []
-        self.prepared_writes = []
-        self.prepared_reads = []
-        self.histogram_lock = threading.Lock()
+class ThreadConnection:
+    """Per-thread connection state for ScyllaDB.
 
-        # Separate histograms for READ and WRITE operations (1 nanosec to 1 hour, 3 sig figs)
+    Each thread in the worker's thread pool gets its own Cluster/Session
+    to avoid contention and provide true connection isolation.
+    """
+
+    def __init__(self, config_dict: dict, col_count: int, payload_cache: bytes):
+        self.config_dict = config_dict
+        self.col_count = col_count
+        self.payload_cache = payload_cache
+        self.cluster = None
+        self.session = None
+        self.prepared_write = None
+        self.prepared_read = None
+
+    def connect(self):
+        """Establish connection and prepare statements."""
+        auth_provider = None
+        if self.config_dict.get("user") and self.config_dict.get("password"):
+            auth_provider = PlainTextAuthProvider(
+                username=self.config_dict["user"],
+                password=self.config_dict["password"],
+            )
+
+        profile = ExecutionProfile(
+            load_balancing_policy=TokenAwarePolicy(DCAwareRoundRobinPolicy()),
+            consistency_level=getattr(ConsistencyLevel, self.config_dict["consistency_level"]),
+        )
+
+        self.cluster = Cluster(
+            contact_points=self.config_dict["nodes"],
+            execution_profiles={EXEC_PROFILE_DEFAULT: profile},
+            protocol_version=4,
+            auth_provider=auth_provider,
+        )
+        self.session = self.cluster.connect()
+        self.session.set_keyspace(self.config_dict["keyspace_name"])
+
+        # Prepare statements
+        placeholders = ", ".join(["?"] * self.col_count)
+        col_names = ", ".join([f'"C{i}"' for i in range(self.col_count)])
+        write_q = f"INSERT INTO {TABLE_NAME} (key, {col_names}) VALUES (?, {placeholders})"
+        read_q = f"SELECT * FROM {TABLE_NAME} WHERE key = ?"
+
+        self.prepared_write = self.session.prepare(write_q)
+        self.prepared_read = self.session.prepare(read_q)
+
+    def shutdown(self):
+        """Close connection."""
+        if self.cluster:
+            self.cluster.shutdown()
+            self.cluster = None
+            self.session = None
+
+
+class WorkerContext:
+    """Context holder for worker process state with per-thread connections.
+
+    Each thread in the worker's thread pool gets its own ThreadConnection.
+    Connections are pre-created before workload starts to avoid latency impact.
+    Histograms and counters are shared across threads with lock protection.
+    """
+
+    def __init__(self, worker_id: int, config_dict: dict):
+        self.worker_id = worker_id
+        self.config_dict = config_dict
+        self.col_count = config_dict["col_count"]
+        self.threads_per_worker = config_dict["threads_per_worker"]
+
+        # Shared payload cache (read-only, generated once)
+        self.payload_cache = b"x" * config_dict["col_size"]
+
+        # Pre-allocated connections (one per thread, indexed by thread number)
+        self._connections: list[ThreadConnection] = []
+
+        # Thread-local storage for connection index assignment
+        self._thread_local = threading.local()
+        self._next_thread_idx = 0
+        self._thread_idx_lock = threading.Lock()
+
+        # Histograms and counters (protected by lock, shared across threads)
+        self.lock = threading.Lock()
+        self.write_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
+        self.read_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
+        self.write_ops = 0
+        self.read_ops = 0
+        self.errors = 0
+
+        # Send histograms frequently (at least 5 times per log interval or every 1s)
+        # to ensure main process has data for aggregation before printing stats
+        self.histogram_interval = min(1.0, config_dict.get("log_interval", 10) / 5.0)
+
+        # Logger
+        self.logger = logging.getLogger(f"worker-{worker_id}")
+
+    def connect_all(self):
+        """Pre-create connections for all threads before workload starts."""
+        self.logger.debug(f"Creating {self.threads_per_worker} connections...")
+        for i in range(self.threads_per_worker):
+            conn = ThreadConnection(self.config_dict, self.col_count, self.payload_cache)
+            conn.connect()
+            self._connections.append(conn)
+        self.logger.debug(f"Created {self.threads_per_worker} connections")
+
+    def _get_connection(self) -> ThreadConnection:
+        """Get the pre-allocated connection for the current thread."""
+        thread_idx = getattr(self._thread_local, "idx", None)
+        if thread_idx is None:
+            # Assign a thread index on first access
+            with self._thread_idx_lock:
+                thread_idx = self._next_thread_idx
+                self._next_thread_idx += 1
+            self._thread_local.idx = thread_idx
+        return self._connections[thread_idx]
+
+    @staticmethod
+    def _generate_key(idx: int) -> bytes:
+        return str(idx).encode("utf-8")
+
+    def _do_write(self, conn: ThreadConnection, key_int: int) -> int:
+        """Execute write using given connection."""
+        args = [self._generate_key(key_int)] + [conn.payload_cache] * conn.col_count
+        t0 = time.perf_counter()
+        conn.session.execute(conn.prepared_write, args)
+        return int((time.perf_counter() - t0) * 1_000_000_000)
+
+    def _do_read(self, conn: ThreadConnection, key_int: int) -> int:
+        """Execute read using given connection."""
+        args = (self._generate_key(key_int),)
+        t0 = time.perf_counter()
+        conn.session.execute(conn.prepared_read, args)
+        return int((time.perf_counter() - t0) * 1_000_000_000)
+
+    def process_task(self, task):
+        """Process a single task using thread-local connection."""
+        key, op_type = task
+        conn = self._get_connection()
+
+        try:
+            if op_type == "write":
+                latency = self._do_write(conn, key)
+                with self.lock:
+                    self.write_histogram.record_value(latency)
+                    self.write_ops += 1
+            else:
+                latency = self._do_read(conn, key)
+                with self.lock:
+                    self.read_histogram.record_value(latency)
+                    self.read_ops += 1
+        except (OSError, RuntimeError, ValueError):
+            with self.lock:
+                self.errors += 1
+
+    def send_histogram_data(self, results_queue):
+        """Send histogram data to results queue."""
+        with self.lock:
+            if self.write_histogram.get_total_count() > 0:
+                results_queue.put(
+                    (
+                        "histogram",
+                        self.worker_id,
+                        "write",
+                        self.write_histogram.encode(),
+                        self.write_ops,
+                        self.errors,
+                    )
+                )
+                self.write_histogram.reset()
+
+            if self.read_histogram.get_total_count() > 0:
+                results_queue.put(
+                    (
+                        "histogram",
+                        self.worker_id,
+                        "read",
+                        self.read_histogram.encode(),
+                        self.read_ops,
+                        0,
+                    )
+                )
+                self.read_histogram.reset()
+
+            self.write_ops = 0
+            self.read_ops = 0
+            self.errors = 0
+
+    def shutdown(self):
+        """Shutdown all thread connections."""
+        for conn in self._connections:
+            try:
+                conn.shutdown()
+            except (OSError, RuntimeError):
+                pass
+        self._connections.clear()
+        self.logger.debug("Shutdown complete")
+
+
+def worker_process(
+    worker_id: int,
+    config_dict: dict,
+    ops_queue: multiprocessing.Queue,
+    results_queue: multiprocessing.Queue,
+    start_barrier: multiprocessing.synchronize.Barrier,
+    stop_event: multiprocessing.synchronize.Event,
+):
+    """
+    Worker process that handles operations with per-thread connections.
+
+    Each thread in the worker's thread pool has its own Cassandra connection,
+    created upfront before the workload starts. This provides true connection
+    isolation without latency impact from lazy initialization.
+
+    Operations are received via ops_queue and results sent via results_queue.
+    """
+    # Setup logging for this worker
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(levelname)s  [Worker-{worker_id}] %(asctime)s %(filename)s:%(lineno)s - %(message)s",
+    )
+
+    ctx = WorkerContext(worker_id, config_dict)
+    threads_per_worker = config_dict["threads_per_worker"]
+
+    try:
+        # Create all connections upfront before workload starts
+        ctx.connect_all()
+
+        # Use thread pool within this process
+        executor = ThreadPoolExecutor(max_workers=threads_per_worker)
+
+        # Signal ready (all connections established)
+        start_barrier.wait()
+        ctx.logger.debug("Started processing operations")
+
+        try:
+            next_histogram_send = time.perf_counter() + ctx.histogram_interval
+            pending_futures = []
+
+            while True:
+                # Check if it's time to send histogram data
+                if time.perf_counter() >= next_histogram_send:
+                    ctx.send_histogram_data(results_queue)
+                    next_histogram_send += ctx.histogram_interval
+
+                # Check for immediate stop signal (duration limit reached)
+                if stop_event.is_set():
+                    # Cancel pending futures and don't wait
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
+                # Get task from queue
+                try:
+                    task = ops_queue.get(timeout=0.1)
+
+                    if task == "graceful":  # Graceful stop - wait for pending (n=X mode)
+                        # Wait for pending operations to complete
+                        for f in pending_futures:
+                            try:
+                                f.result(timeout=30)
+                            except (OSError, RuntimeError, ValueError, TimeoutError):
+                                pass
+                        executor.shutdown(wait=True)
+                        break
+
+                    if task is not None:
+                        f = executor.submit(ctx.process_task, task)
+                        pending_futures.append(f)
+
+                        # Prune completed futures
+                        if len(pending_futures) > threads_per_worker * 10:
+                            pending_futures = [fut for fut in pending_futures if not fut.done()]
+                except queue.Empty:
+                    continue
+        finally:
+            # Ensure executor is shutdown if logic breaks out unexpectedly
+            # (e.g. exceptions). If already shutdown, this is no-op.
+            # We use wait=False here to assume if we crashed out, we want fast exit.
+            # If we exited cleanly loop via 'break', we already called shutdown appropriately above
+            # (or for None case, we explicitly called wait=False).
+            # However, checking if it's shutdown is internal API.
+            # Simplest is just to call it with wait=False as a safety net.
+            # But wait: if we did graceful shutdown, we don't want to double call?
+            # Double call is fine.
+            # But if we did graceful, we waited. If we call wait=False now, it's fine.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        # Send final histogram data and signal completion BEFORE cluster shutdown
+        # This allows stats collector to proceed without waiting for Cassandra cleanup
+        ctx.send_histogram_data(results_queue)
+        results_queue.put(("done", worker_id, None, None, 0, 0))
+
+        # Now shutdown cluster (this may take time but doesn't block stats)
+        ctx.shutdown()
+
+    except (OSError, RuntimeError, ValueError, ConnectionError) as e:
+        ctx.logger.error(f"Worker failed: {e}")
+        results_queue.put(("error", worker_id, str(e), None, 0, 0))
+
+
+class StatsCollectorContext:
+    """Context holder for stats collector process state."""
+
+    def __init__(self, config_dict: dict):
+        self.config_dict = config_dict
+        self.log_interval = config_dict.get("log_interval", 10)
+        self.output_file = config_dict.get("output_file", "pystress.hdr")
+
         # Summary histograms - accumulated across all intervals for final summary
         self.write_summary_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
         self.read_summary_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
@@ -667,34 +971,415 @@ class CassandraStressPy:
         self.write_interval_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
         self.read_interval_histogram = HdrHistogram(1, 60 * 60 * 1_000_000_000, 3)
 
-        # Interval statistics tracking
+        # Counters
         self.write_interval_ops = 0
         self.read_interval_ops = 0
         self.interval_errors = 0
         self.total_write_ops = 0
         self.total_read_ops = 0
         self.total_errors = 0
-        self.stats_lock = threading.Lock()
+
+        # Timing
+        self.start_time = None
+        self.start_timestamp = None
         self.last_interval_time = 0
         self.stats_header_printed = False
 
-        # HDR file writer (initialized in run())
+        # HDR file writer
         self.hdr_file = None
         self.hdr_writer = None
-        self.start_timestamp = None
 
-        # Pre-cache max payload size if fixed, or just max for buffer if we use it consistently
-        if self.config.col_size_dist["type"] == "FIXED":
-            self._payload_cache = b"x" * self.config.col_size_dist["value"]
+        # Logger
+        self.logger = logging.getLogger("stats-collector")
+
+    def init_hdr_writer(self):
+        """Initialize HDR histogram file writer."""
+        try:
+            self.hdr_file = open(self.output_file, "w")
+            self.hdr_writer = TaggedHistogramLogWriter(self.hdr_file)
+            self.hdr_writer.output_comment("Logging op latencies for Cassandra Stress")
+            self.hdr_writer.output_log_format_version()
+            self.hdr_writer.output_base_time(self.start_timestamp)
+            self.hdr_writer.output_start_time(self.start_timestamp)
+            self.hdr_writer.output_legend()
+        except OSError as e:
+            self.logger.error(f"Failed to open HDR file: {e}")
+
+    def aggregate_result(self, result):
+        """Aggregate a single worker result into histograms and counters.
+
+        Returns True if this was a 'done' or 'error' message.
+        """
+        msg_type = result[0]
+        if msg_type == "histogram":
+            _, worker_id, op_type, encoded, ops_count, err_count = result
+            temp_hist = HdrHistogram.decode(encoded)
+            if op_type == "write":
+                self.write_summary_histogram.add(temp_hist)
+                self.write_interval_histogram.add(temp_hist)
+                self.write_interval_ops += ops_count
+                self.total_write_ops += ops_count
+            else:
+                self.read_summary_histogram.add(temp_hist)
+                self.read_interval_histogram.add(temp_hist)
+                self.read_interval_ops += ops_count
+                self.total_read_ops += ops_count
+            self.interval_errors += err_count
+            self.total_errors += err_count
+            return False
+        elif msg_type == "done":
+            return True
+        elif msg_type == "error":
+            _, worker_id, error_msg, _, _, _ = result
+            self.logger.error(f"Worker {worker_id} error: {error_msg}")
+            return True
+        return False
+
+    def output_interval_histograms(self, elapsed_time):
+        """Output interval histograms to HDR file."""
+        if not self.hdr_writer:
+            return
+
+        interval_start_ms = int(self.last_interval_time * 1000)
+        interval_end_ms = int(elapsed_time * 1000)
+
+        if self.write_interval_histogram.get_total_count() > 0:
+            self.write_interval_histogram.set_tag("WRITE-st")
+            self.write_interval_histogram.set_start_time_stamp(interval_start_ms)
+            self.write_interval_histogram.set_end_time_stamp(interval_end_ms)
+            self.hdr_writer.output_interval_histogram(self.write_interval_histogram)
+
+        if self.read_interval_histogram.get_total_count() > 0:
+            self.read_interval_histogram.set_tag("READ-st")
+            self.read_interval_histogram.set_start_time_stamp(interval_start_ms)
+            self.read_interval_histogram.set_end_time_stamp(interval_end_ms)
+            self.hdr_writer.output_interval_histogram(self.read_interval_histogram)
+
+    def print_interval_stats(self, elapsed_time):
+        """Print interval statistics in cassandra-stress format."""
+        total_interval_ops = self.write_interval_ops + self.read_interval_ops
+        if total_interval_ops == 0:
+            return
+
+        interval_duration = elapsed_time - self.last_interval_time
+        if interval_duration <= 0:
+            return
+
+        ops_per_sec = total_interval_ops / interval_duration
+        total_ops = self.total_write_ops + self.total_read_ops
+        interval_errors = self.interval_errors
+
+        # Reset interval counters
+        self.write_interval_ops = 0
+        self.read_interval_ops = 0
+        self.interval_errors = 0
+        self.last_interval_time = elapsed_time
+
+        # Extract histogram data
+        write_count = self.write_interval_histogram.get_total_count()
+        read_count = self.read_interval_histogram.get_total_count()
+
+        if write_count > 0 and read_count > 0:
+            total_count = write_count + read_count
+            mean_ms = (
+                (
+                    self.write_interval_histogram.get_mean_value() * write_count
+                    + self.read_interval_histogram.get_mean_value() * read_count
+                )
+                / total_count
+                / 1_000_000.0
+            )
+            hist = self.write_interval_histogram if write_count >= read_count else self.read_interval_histogram
+            median_ms = hist.get_value_at_percentile(50.0) / 1_000_000.0
+            p95_ms = hist.get_value_at_percentile(95.0) / 1_000_000.0
+            p99_ms = hist.get_value_at_percentile(99.0) / 1_000_000.0
+            p999_ms = hist.get_value_at_percentile(99.9) / 1_000_000.0
+            max_ms = (
+                max(
+                    self.write_interval_histogram.get_max_value(),
+                    self.read_interval_histogram.get_max_value(),
+                )
+                / 1_000_000.0
+            )
+        elif write_count > 0:
+            mean_ms = self.write_interval_histogram.get_mean_value() / 1_000_000.0
+            median_ms = self.write_interval_histogram.get_value_at_percentile(50.0) / 1_000_000.0
+            p95_ms = self.write_interval_histogram.get_value_at_percentile(95.0) / 1_000_000.0
+            p99_ms = self.write_interval_histogram.get_value_at_percentile(99.0) / 1_000_000.0
+            p999_ms = self.write_interval_histogram.get_value_at_percentile(99.9) / 1_000_000.0
+            max_ms = self.write_interval_histogram.get_max_value() / 1_000_000.0
+        elif read_count > 0:
+            mean_ms = self.read_interval_histogram.get_mean_value() / 1_000_000.0
+            median_ms = self.read_interval_histogram.get_value_at_percentile(50.0) / 1_000_000.0
+            p95_ms = self.read_interval_histogram.get_value_at_percentile(95.0) / 1_000_000.0
+            p99_ms = self.read_interval_histogram.get_value_at_percentile(99.0) / 1_000_000.0
+            p999_ms = self.read_interval_histogram.get_value_at_percentile(99.9) / 1_000_000.0
+            max_ms = self.read_interval_histogram.get_max_value() / 1_000_000.0
         else:
-            # For UNIFORM, we might need variable payloads, but we can cache the max size and slice it?
-            # Or just generate fresh. Slicing from max cache is faster.
-            # Only if Uniform max is reasonable.
-            max_size = self.config.col_size
-            self._payload_cache = b"x" * max_size
+            mean_ms = median_ms = p95_ms = p99_ms = p999_ms = max_ms = 0.0
 
-    def connect(self):
-        logger.info(f"Connecting to {self.config.nodes}...")
+        # Reset interval histograms
+        self.write_interval_histogram.reset()
+        self.read_interval_histogram.reset()
+
+        # Print stats
+        if not self.stats_header_printed:
+            print(
+                f"{'total ops':>10}, {'op/s':>8}, {'mean':>6}, {'med':>7}, {'.95':>7}, "
+                f"{'.99':>7}, {'.999':>7}, {'max':>7}, {'time':>6}, {'errors':>7}"
+            )
+            self.stats_header_printed = True
+
+        print(
+            f"{total_ops:>10}, {ops_per_sec:>8.0f}, {mean_ms:>6.1f}, {median_ms:>7.1f}, "
+            f"{p95_ms:>7.1f}, {p99_ms:>7.1f}, {p999_ms:>7.1f}, {max_ms:>7.1f}, "
+            f"{elapsed_time:>6.1f}, {interval_errors:>7}"
+        )
+
+    def save_hdr(self):
+        """Close HDR histogram file."""
+        if self.hdr_file:
+            try:
+                self.hdr_file.close()
+                self.logger.info(f"HDR histogram saved to {self.output_file}")
+            except OSError as e:
+                self.logger.error(f"Failed to close HDR file: {e}")
+
+    def get_summary_data(self):
+        """Return summary data for the main process to print."""
+        return {
+            "total_write_ops": self.total_write_ops,
+            "total_read_ops": self.total_read_ops,
+            "total_errors": self.total_errors,
+            "write_hist_encoded": self.write_summary_histogram.encode()
+            if self.write_summary_histogram.get_total_count() > 0
+            else None,
+            "read_hist_encoded": self.read_summary_histogram.encode()
+            if self.read_summary_histogram.get_total_count() > 0
+            else None,
+        }
+
+
+def stats_collector_process(
+    config_dict: dict,
+    results_queue: multiprocessing.Queue,
+    summary_queue: multiprocessing.Queue,
+    start_barrier: multiprocessing.synchronize.Barrier,
+):
+    """
+    Stats collector process that aggregates histograms and prints periodic statistics.
+
+    Receives histogram data from workers via results_queue.
+    Sends final summary data to main process via summary_queue.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s  [StatsCollector] %(asctime)s %(filename)s:%(lineno)s - %(message)s",
+    )
+
+    ctx = StatsCollectorContext(config_dict)
+
+    start_barrier.wait()
+
+    ctx.start_time = time.perf_counter()
+    ctx.start_timestamp = time.time() * 1000
+
+    # Re-capture start time to ignore process spawn overhead
+    ctx.init_hdr_writer()
+
+    next_interval_time = ctx.start_time + ctx.log_interval
+    workers_running = config_dict["num_workers"]
+
+    try:
+        all_workers_joined = False
+        while workers_running > 0 and not all_workers_joined:
+            # Collect results with timeout
+            try:
+                result = results_queue.get(timeout=0.1)
+
+                msg_type = result[0]
+                if msg_type == "all_joined":
+                    # Main process has joined all workers - exit even if not all "done" received
+                    # This handles cases where workers were killed before sending "done"
+                    all_workers_joined = True
+                elif ctx.aggregate_result(result):
+                    workers_running -= 1
+            except queue.Empty:
+                pass
+
+            # Check if it's time to print stats
+            if time.perf_counter() >= next_interval_time:
+                # Use strict interval timing for reporting to avoid drift (e.g. print 1.0 instead of 1.003)
+                report_time = next_interval_time
+                elapsed = report_time - ctx.start_time
+
+                ctx.output_interval_histograms(elapsed)
+                ctx.print_interval_stats(elapsed)
+                next_interval_time += ctx.log_interval
+
+        # Final stats output
+        elapsed = time.perf_counter() - ctx.start_time
+        ctx.output_interval_histograms(elapsed)
+        ctx.print_interval_stats(elapsed)
+
+        ctx.save_hdr()
+
+        # Send summary data to main process
+        summary_queue.put(ctx.get_summary_data())
+
+    except (OSError, RuntimeError, ValueError) as e:
+        ctx.logger.error(f"Stats collector failed: {e}")
+        summary_queue.put({"error": str(e)})
+
+
+class ProcessPoolManager:
+    """Manages worker processes and stats collector for parallel operation execution."""
+
+    def __init__(self, config):
+        self.config = config
+        self.workers = []
+        self.ops_queue = None
+        self.results_queue = None
+        self.summary_queue = None
+        self.stats_process = None
+        self.stop_event = multiprocessing.Event()
+
+    def _config_to_dict(self):
+        """Convert config to a picklable dict."""
+        return {
+            "nodes": self.config.nodes,
+            "user": self.config.user,
+            "password": self.config.password,
+            "consistency_level": consistency_value_to_name(self.config.consistency_level),
+            "keyspace_name": self.config.keyspace_name,
+            "col_count": self.config.col_count,
+            "col_size": self.config.col_size,
+            "log_interval": self.config.log_interval,
+            "output_file": self.config.output_file,
+            "num_workers": self.config.processes,
+            "threads_per_worker": self.config.threads_per_worker,
+        }
+
+    def start_workers(self):
+        """Spawn worker processes and stats collector."""
+        self.results_queue = multiprocessing.Queue()
+        self.summary_queue = multiprocessing.Queue()
+        start_barrier = multiprocessing.Barrier(self.config.processes + 2)
+        config_dict = self._config_to_dict()
+
+        # Start stats collector process first
+        self.stats_process = multiprocessing.Process(
+            target=stats_collector_process,
+            args=(
+                config_dict,
+                self.results_queue,
+                self.summary_queue,
+                start_barrier,
+            ),
+        )
+        self.stats_process.start()
+
+        # Bound the queue size to prevent infinite buffering (which causes long shutdown times)
+        # Size proportional to the total number of threads to ensure backpressure works
+        self.ops_queue = multiprocessing.Queue(maxsize=self.config.processes * self.config.threads_per_worker * 100)
+
+        for i in range(self.config.processes):
+            p = multiprocessing.Process(
+                target=worker_process,
+                args=(
+                    i,
+                    config_dict,
+                    self.ops_queue,
+                    self.results_queue,
+                    start_barrier,
+                    self.stop_event,
+                ),
+            )
+            p.start()
+            self.workers.append(p)
+
+        # Wait for all workers to be ready
+        logger.debug(f"Waiting for {self.config.processes} workers to initialize...")
+        start_barrier.wait()
+        logger.debug("All workers ready")
+
+    def submit_operation(self, key: int, op_type: str, timeout=None):
+        """Submit operation to workers."""
+        self.ops_queue.put((key, op_type), timeout=timeout)
+
+    def stop_workers(self, graceful: bool = False):
+        """Signal workers to stop and wait for them to terminate.
+
+        Args:
+            graceful: If True, workers wait for pending operations (n=X mode).
+                      If False, workers exit immediately (duration mode).
+        """
+        if graceful:
+            # In fixed ops mode, wait for queue to drain before sending stop signals
+            logger.info("Waiting for operations queue to drain...")
+            while not self.ops_queue.empty():
+                time.sleep(0.1)
+        else:
+            # Signal workers to stop
+            self.stop_event.set()
+
+        # Send one stop signal per worker to the shared queue
+        # We still send None to wake up workers stuck in queue.get()
+        stop_signal = "graceful" if graceful else None
+        for _ in self.workers:
+            try:
+                self.ops_queue.put_nowait(stop_signal)
+            except queue.Full:
+                # If queue is full, worker is busy processing and will check stop_event soon
+                pass
+
+        # Wait for worker processes to terminate
+        for p in self.workers:
+            # Workers signal 'done' before cluster shutdown, so they should exit quickly
+            p.join(timeout=5)
+            if p.is_alive():
+                # Worker is stuck in cluster.shutdown() - kill it, data is already collected
+                p.kill()
+                p.join(timeout=1)
+
+        # Signal stats collector that all workers have been joined
+        # This helps if any worker was killed before sending its "done" message
+        if self.results_queue:
+            self.results_queue.put(("all_joined", None, None, None, 0, 0))
+
+        self.ops_queue.cancel_join_thread()
+
+    def get_summary(self):
+        """Get summary data from stats collector and cleanup the process."""
+        if self.summary_queue is None:
+            return None
+        try:
+            summary = self.summary_queue.get(timeout=30)
+        except queue.Empty:
+            logger.error("Timeout waiting for summary from stats collector")
+            summary = None
+
+        # Join the stats collector process after getting summary (or timeout)
+        if self.stats_process:
+            self.stats_process.join(timeout=5)
+            if self.stats_process.is_alive():
+                logger.warning("Stats collector process did not exit cleanly, killing it")
+                self.stats_process.kill()
+                self.stats_process.join(timeout=1)
+
+        return summary
+
+
+class CassandraStressPy:
+    def __init__(self, config):
+        self.config = config
+
+    def setup_schema(self):
+        """Connect to cluster, create keyspace and table, then disconnect.
+
+        Workers create their own connections for actual workload execution.
+        """
+        logger.info(f"Connecting to {self.config.nodes} for schema setup...")
 
         auth_provider = None
         if self.config.user and self.config.password:
@@ -705,98 +1390,44 @@ class CassandraStressPy:
             consistency_level=self.config.consistency_level,
         )
 
-        cluster_count = 1
-        if self.config.connections_per_host:
-            cluster_count = max(1, int(self.config.connections_per_host))
-            logger.info(f"Creating {cluster_count} cluster connections for connectionsPerHost={cluster_count}")
+        cluster = Cluster(
+            contact_points=self.config.nodes,
+            execution_profiles={EXEC_PROFILE_DEFAULT: profile},
+            protocol_version=4,
+            auth_provider=auth_provider,
+        )
+        session = cluster.connect()
 
-        for _ in range(cluster_count):
-            cluster = Cluster(
-                contact_points=self.config.nodes,
-                execution_profiles={EXEC_PROFILE_DEFAULT: profile},
-                protocol_version=4,
-                auth_provider=auth_provider,
-            )
-            session = cluster.connect()
-            self.clusters.append(cluster)
-            self.sessions.append(session)
-
-        logger.info("Connected.")
-
-    def setup_schema(self):
-        logger.info("Setting up schema...")
-        if self.config.replication_strategy == "NetworkTopologyStrategy":
-            strategy = f"{{'class': 'NetworkTopologyStrategy', 'replication_factor': {self.config.replication_factor}}}"
-        else:
-            strategy = f"{{'class': 'SimpleStrategy', 'replication_factor': {self.config.replication_factor}}}"
-
-        keyspace_name = self.config.keyspace_name
-        session = self.sessions[0]
-        session.execute(f"CREATE KEYSPACE IF NOT EXISTS {keyspace_name} WITH replication = {strategy}")
-        session.execute(f"USE {keyspace_name}")
-
-        # Mimic standard1 table
-        # We start columns from C1 because C0 is often used but cassandra-stress uses C0..CN.
-        # Standard1 in cassandra-stress usually (key, C0, C1, C2, C3, C4)
-        cols = ", ".join([f'"C{i}" blob' for i in range(self.config.col_count)])
-        stmt = f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} (key blob PRIMARY KEY, {cols})"
-
-        # Add table options (compaction and compression)
-        table_options = []
-        if self.config.compaction_strategy:
-            table_options.append(f"compaction = {{'class': '{self.config.compaction_strategy}'}}")
-        if self.config.compression:
-            table_options.append(f"compression = {{'sstable_compression': '{self.config.compression}'}}")
-
-        if table_options:
-            stmt += " WITH " + " AND ".join(table_options)
-
-        session.execute(stmt)
-
-        placeholders = ", ".join(["?"] * self.config.col_count)
-        col_names = ", ".join([f'"C{i}"' for i in range(self.config.col_count)])
-
-        write_q = f"INSERT INTO {TABLE_NAME} (key, {col_names}) VALUES (?, {placeholders})"
-        read_q = f"SELECT * FROM {TABLE_NAME} WHERE key = ?"
-
-        self.prepared_writes = []
-        self.prepared_reads = []
-        for prep_session in self.sessions:
-            prep_session.set_keyspace(keyspace_name)
-            logger.info(f"Prepare Write: {write_q}")
-            self.prepared_writes.append(prep_session.prepare(write_q))
-            logger.info(f"Prepare Read: {read_q}")
-            self.prepared_reads.append(prep_session.prepare(read_q))
-
-    def _generate_payloads(self):
-        # Determine actual count for this op
-        actual_count = self.config.col_count
-        if self.config.col_count_dist["type"] == "UNIFORM":
-            actual_count = random.randint(self.config.col_count_dist["min"], self.config.col_count_dist["max"])
-
-        payloads = []
-        for i in range(self.config.col_count):  # Iterate over schema columns (max)
-            if i < actual_count:
-                if self.config.col_size_dist["type"] == "FIXED":
-                    payloads.append(self._payload_cache)
-                else:
-                    # Variable size
-                    size = self.config.col_size
-                    if self.config.col_size_dist["type"] == "UNIFORM":
-                        size = random.randint(self.config.col_size_dist["min"], self.config.col_size_dist["max"])
-
-                    # Optimization: slice from cache if possible
-                    if len(self._payload_cache) >= size:
-                        payloads.append(self._payload_cache[:size])
-                    else:
-                        payloads.append(b"x" * size)
+        try:
+            if self.config.replication_strategy == "NetworkTopologyStrategy":
+                strategy = (
+                    f"{{'class': 'NetworkTopologyStrategy', 'replication_factor': {self.config.replication_factor}}}"
+                )
             else:
-                payloads.append(None)
-        return payloads
+                strategy = f"{{'class': 'SimpleStrategy', 'replication_factor': {self.config.replication_factor}}}"
 
-    def _generate_key(self, idx):
-        # cassandra-stress keys are blobs, often string reps of numbers
-        return str(idx).encode("utf-8")
+            keyspace_name = self.config.keyspace_name
+            session.execute(f"CREATE KEYSPACE IF NOT EXISTS {keyspace_name} WITH replication = {strategy}")
+            session.execute(f"USE {keyspace_name}")
+
+            # Mimic standard1 table
+            cols = ", ".join([f'"C{i}" blob' for i in range(self.config.col_count)])
+            stmt = f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} (key blob PRIMARY KEY, {cols})"
+
+            # Add table options (compaction and compression)
+            table_options = []
+            if self.config.compaction_strategy:
+                table_options.append(f"compaction = {{'class': '{self.config.compaction_strategy}'}}")
+            if self.config.compression:
+                table_options.append(f"compression = {{'sstable_compression': '{self.config.compression}'}}")
+
+            if table_options:
+                stmt += " WITH " + " AND ".join(table_options)
+
+            session.execute(stmt)
+            logger.info("Schema setup complete.")
+        finally:
+            cluster.shutdown()
 
     def _create_key_generator(self):
         """Create a key generator based on population distribution config."""
@@ -834,337 +1465,140 @@ class CassandraStressPy:
 
         return key_gen()
 
-    def _record_latency(self, op_type, latency_nanos):
-        """Record latency value to appropriate histograms."""
-        with self.histogram_lock:
-            if op_type == "write":
-                self.write_summary_histogram.record_value(latency_nanos)
-                self.write_interval_histogram.record_value(latency_nanos)
-            else:
-                self.read_summary_histogram.record_value(latency_nanos)
-                self.read_interval_histogram.record_value(latency_nanos)
-        with self.stats_lock:
-            if op_type == "write":
-                self.write_interval_ops += 1
-                self.total_write_ops += 1
-            else:
-                self.read_interval_ops += 1
-                self.total_read_ops += 1
-
-    def _record_error(self):
-        """Record an operation error."""
-        with self.stats_lock:
-            self.interval_errors += 1
-            self.total_errors += 1
-
-    def _run_workload(self, start_time, threads):  # noqa: PLR0914, PLR0915
-        """Execute the main workload loop."""
-        fixed_payloads = None
-        if self.config.col_size_dist["type"] == "FIXED" and self.config.col_count_dist["type"] == "FIXED":
-            fixed_payloads = [self._payload_cache for _ in range(self.config.col_count)]
-
-        sessions_count = len(self.sessions)
-        session_lock = threading.Lock()
-        session_idx = [0]  # Use list for nonlocal mutation
-        keys = self._create_key_generator()
-
-        end_time = start_time + self.config.duration if self.config.duration else None
-        throttle_delay = 1.0 / self.config.throttle if self.config.throttle else 0
-        self.last_interval_time = 0
-
-        def on_done(f, op_type):
-            try:
-                self._record_latency(op_type, f.result())
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.error(f"Op failed: {e}")
-                self._record_error()
-
-        def pick_session():
-            with session_lock:
-                idx = session_idx[0]
-                session_idx[0] = (idx + 1) % sessions_count
-            return idx
-
-        def do_write(key_int, sidx):
-            payloads = fixed_payloads if fixed_payloads else self._generate_payloads()
-            args = [self._generate_key(key_int)] + payloads
-            t0 = time.perf_counter()
-            self.sessions[sidx].execute(self.prepared_writes[sidx], args)
-            return int((time.perf_counter() - t0) * 1_000_000_000)
-
-        def do_read(key_int, sidx):
-            t0 = time.perf_counter()
-            self.sessions[sidx].execute(self.prepared_reads[sidx], (self._generate_key(key_int),))
-            return int((time.perf_counter() - t0) * 1_000_000_000)
-
-        is_mixed = self.config.command == "mixed"
-        default_task = do_write if self.config.command == "write" else do_read
-        ratio_write = self.config.ratio_write / (self.config.ratio_write + self.config.ratio_read)
-
-        return self._execute_operations(
-            threads,
-            keys,
-            end_time,
-            throttle_delay,
-            start_time,
-            is_mixed,
-            default_task,
-            do_write,
-            do_read,
-            ratio_write,
-            pick_session,
-            on_done,
-        )
-
-    def _execute_operations(
-        self,
-        threads,
-        keys,
-        end_time,
-        throttle_delay,
-        start_time,
-        is_mixed,
-        default_task,
-        do_write,
-        do_read,
-        ratio_write,
-        pick_session,
-        on_done,
-    ):  # noqa: PLR0913
-        """Execute the operation submission loop."""
-        next_op_time = start_time
-        next_interval_time = start_time + self.config.log_interval
-        max_pending = threads * 50
-
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = []
-            submitted = 0
-
-            while True:
-                now = time.perf_counter()
-                if end_time and now >= end_time:
-                    break
-                if not self.config.duration and submitted >= self.config.num_operations:
-                    break
-
-                if throttle_delay > 0:
-                    if now < next_op_time:
-                        time.sleep(next_op_time - now)
-                    next_op_time = max(next_op_time + throttle_delay, now + throttle_delay)
-
-                try:
-                    k = next(keys)
-                except StopIteration:
-                    break
-
-                idx = pick_session()
-                if is_mixed:
-                    op_type = "write" if random.random() < ratio_write else "read"
-                    task = do_write if op_type == "write" else do_read
-                else:
-                    op_type = self.config.command
-                    task = default_task
-
-                f = executor.submit(task, k, idx)
-                f.add_done_callback(lambda fut, ot=op_type: on_done(fut, ot))
-                futures.append(f)
-                submitted += 1
-
-                if len(futures) >= max_pending:
-                    futures = [fut for fut in futures if not fut.done()]
-                    while len(futures) >= max_pending:
-                        time.sleep(0.005)
-                        futures = [fut for fut in futures if not fut.done()]
-
-                if time.perf_counter() >= next_interval_time:
-                    elapsed = time.perf_counter() - start_time
-                    self._output_interval_histograms(elapsed)
-                    self.print_interval_stats(elapsed)
-                    next_interval_time = time.perf_counter() + self.config.log_interval
-
-            logger.info("Waiting for pending tasks...")
-            for f in futures:
-                try:
-                    f.result()
-                except (OSError, RuntimeError, ValueError):
-                    pass
-
-        return submitted
-
     def run(self):
-        self.connect()
         try:
             self.setup_schema()
         except (OSError, RuntimeError) as e:
             logger.error(f"Schema setup failed; aborting run: {e}")
             return
 
-        threads = self.config.threads
+        keys = self._create_key_generator()
+
         logger.info(
-            f"Starting {self.config.command} workload: {self.config.num_operations} ops, {threads} threads, "
+            f"Starting {self.config.command} workload: "
+            f"{self.config.num_operations or 'unlimited'} ops, "
+            f"{self.config.processes} worker(s) x {self.config.threads_per_worker} threads, "
             f"CL={self.config.consistency_level}, ColSize={self.config.col_size}, ColCount={self.config.col_count}"
         )
 
-        start_time = time.perf_counter()
-        self.start_timestamp = time.time() * 1000  # Epoch milliseconds for HDR file header
-        self._init_hdr_writer()
+        current_key = None
+        current_op = self.config.command
+        is_mixed = current_op == "mixed"
+        ratio_write = self.config.ratio_write / (self.config.ratio_write + self.config.ratio_read)
 
-        submitted = self._run_workload(start_time, threads)
+        throttle_delay = 1.0 / self.config.throttle if self.config.throttle else 0
+        to_submit = self.config.num_operations if not self.config.duration else -1
 
-        total_duration = time.perf_counter() - start_time
-        self._output_interval_histograms(total_duration)
-        self.print_interval_stats(total_duration)
+        # Start worker processes and stats collector
+        manager = ProcessPoolManager(self.config)
+        manager.start_workers()
 
-        self.save_hdr()
-        self.print_summary(total_duration, submitted)
-        for cluster in self.clusters:
-            cluster.shutdown()
+        next_op_time = start_time = time.perf_counter()
+        end_time = start_time + self.config.duration if self.config.duration else float("inf")
 
-    def _init_hdr_writer(self):
-        """Initialize HDR histogram file writer with headers."""
         try:
-            self.hdr_file = open(self.config.output_file, "w")
-            self.hdr_writer = TaggedHistogramLogWriter(self.hdr_file)
+            while True:
+                now = time.perf_counter()
 
-            # Match cassandra-stress header format
-            self.hdr_writer.output_comment("Logging op latencies for Cassandra Stress")
-            self.hdr_writer.output_log_format_version()  # 1.2 (Python library limitation)
-            self.hdr_writer.output_base_time(self.start_timestamp)
-            self.hdr_writer.output_start_time(self.start_timestamp)
-            self.hdr_writer.output_legend()
-        except OSError as e:
-            logger.error(f"Failed to initialize HDR file: {e}")
-            self.hdr_file = None
-            self.hdr_writer = None
+                # Check termination conditions
+                if now >= end_time or to_submit == 0:
+                    break
 
-    def _output_interval_histograms(self, elapsed_time):
-        """Output interval histograms to HDR file."""
-        if not self.hdr_writer:
+                # Rate limiting
+                if throttle_delay > 0:
+                    if now < next_op_time:
+                        time.sleep(next_op_time - now)
+                    next_op_time = next_op_time + throttle_delay
+
+                # Get next key only if we successfully submitted the previous one
+                if current_key is None:
+                    try:
+                        current_key = next(keys)
+                    except StopIteration:
+                        break
+
+                    if is_mixed:
+                        current_op = "write" if random.random() < ratio_write else "read"
+
+                try:
+                    manager.submit_operation(current_key, current_op, timeout=0.001)
+                    to_submit -= 1
+                    current_key = None
+                except queue.Full:
+                    # Queue is full, retry after short sleep
+                    time.sleep(0.001)
+
+            # Use graceful stop for n=X mode (wait for pending ops)
+            # Use immediate stop for duration mode (exit fast)
+            graceful = not self.config.duration
+
+            # Signal workers to stop and wait for completion
+            logger.debug("Stopping workers...")
+            manager.stop_workers(graceful=graceful)
+
+            # Get summary from stats collector
+            summary = manager.get_summary()
+        except Exception:
+            # Ensure workers are stopped on error (immediate stop)
+            manager.stop_workers(graceful=False)
+            raise
+
+        self.print_summary(summary, time.perf_counter() - start_time)
+
+    @staticmethod
+    def _get_histogram_stats(histogram):
+        """Extract latency stats from histogram as dict (values in ms)."""
+        if histogram.get_total_count() > 0:
+            return {
+                "mean": histogram.get_mean_value() / 1_000_000.0,
+                "median": histogram.get_value_at_percentile(50.0) / 1_000_000.0,
+                "p95": histogram.get_value_at_percentile(95.0) / 1_000_000.0,
+                "p99": histogram.get_value_at_percentile(99.0) / 1_000_000.0,
+                "p999": histogram.get_value_at_percentile(99.9) / 1_000_000.0,
+                "max": histogram.get_max_value() / 1_000_000.0,
+                "count": histogram.get_total_count(),
+            }
+        return {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "p999": 0.0, "max": 0.0, "count": 0}
+
+    def print_summary(self, summary, duration):
+        """Print final summary using data from stats collector."""
+        if summary is None or "error" in summary:
+            logger.error("No summary data available")
             return
 
-        with self.histogram_lock:
-            # Calculate timestamps for this interval (in milliseconds)
-            interval_start_ms = int(self.last_interval_time * 1000)
-            interval_end_ms = int(elapsed_time * 1000)
+        # Decode histograms if present
+        write_hist = None
+        read_hist = None
+        if summary.get("write_hist_encoded"):
+            write_hist = HdrHistogram.decode(summary["write_hist_encoded"])
+        if summary.get("read_hist_encoded"):
+            read_hist = HdrHistogram.decode(summary["read_hist_encoded"])
 
-            # Output WRITE histogram if has data
-            if self.write_interval_histogram.get_total_count() > 0:
-                self.write_interval_histogram.set_tag("WRITE-st")
-                self.write_interval_histogram.set_start_time_stamp(interval_start_ms)
-                self.write_interval_histogram.set_end_time_stamp(interval_end_ms)
-                self.hdr_writer.output_interval_histogram(self.write_interval_histogram)
+        total_write_ops = summary.get("total_write_ops", 0)
+        total_read_ops = summary.get("total_read_ops", 0)
 
-            # Output READ histogram if has data
-            if self.read_interval_histogram.get_total_count() > 0:
-                self.read_interval_histogram.set_tag("READ-st")
-                self.read_interval_histogram.set_start_time_stamp(interval_start_ms)
-                self.read_interval_histogram.set_end_time_stamp(interval_end_ms)
-                self.hdr_writer.output_interval_histogram(self.read_interval_histogram)
+        # Format duration as HH:MM:SS
+        hours, remainder = divmod(int(duration), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-    def save_hdr(self):
-        """Close HDR histogram file."""
-        if self.hdr_file:
-            try:
-                self.hdr_file.close()
-                logger.info(f"HDR histogram saved to {self.config.output_file}")
-            except OSError as e:
-                logger.error(f"Failed to close HDR file: {e}")
+        print("\nResults:")
 
-    def print_interval_stats(self, elapsed_time):
-        """Print interval statistics in cassandra-stress format."""
-        with self.stats_lock:
-            total_interval_ops = self.write_interval_ops + self.read_interval_ops
-            if total_interval_ops == 0:
-                return
+        if self.config.command == "write":
+            self._print_op_summary("WRITE", write_hist, duration, total_write_ops)
+        elif self.config.command == "read":
+            self._print_op_summary("READ", read_hist, duration, total_read_ops)
+        else:  # mixed
+            self._print_mixed_summary(write_hist, read_hist, total_write_ops, total_read_ops, duration)
 
-            # Calculate ops/s for this interval
-            interval_duration = elapsed_time - self.last_interval_time
-            if interval_duration <= 0:
-                return
+        print(f"Total operation time      : {duration_str}")
 
-            ops_per_sec = total_interval_ops / interval_duration
-
-            # Combine read and write histograms for console stats
-            # We need to get combined stats from both histograms
-            with self.histogram_lock:
-                write_count = self.write_interval_histogram.get_total_count()
-                read_count = self.read_interval_histogram.get_total_count()
-
-                if write_count > 0 and read_count > 0:
-                    # Combine stats weighted by count
-                    total_count = write_count + read_count
-                    mean_ms = (
-                        (
-                            self.write_interval_histogram.get_mean_value() * write_count
-                            + self.read_interval_histogram.get_mean_value() * read_count
-                        )
-                        / total_count
-                        / 1_000_000.0
-                    )
-                    # For percentiles, use the histogram with more samples (approximate)
-                    if write_count >= read_count:
-                        hist = self.write_interval_histogram
-                    else:
-                        hist = self.read_interval_histogram
-                    median_ms = hist.get_value_at_percentile(50.0) / 1_000_000.0
-                    p95_ms = hist.get_value_at_percentile(95.0) / 1_000_000.0
-                    p99_ms = hist.get_value_at_percentile(99.0) / 1_000_000.0
-                    p999_ms = hist.get_value_at_percentile(99.9) / 1_000_000.0
-                    max_ms = (
-                        max(
-                            self.write_interval_histogram.get_max_value(),
-                            self.read_interval_histogram.get_max_value(),
-                        )
-                        / 1_000_000.0
-                    )
-                elif write_count > 0:
-                    mean_ms = self.write_interval_histogram.get_mean_value() / 1_000_000.0
-                    median_ms = self.write_interval_histogram.get_value_at_percentile(50.0) / 1_000_000.0
-                    p95_ms = self.write_interval_histogram.get_value_at_percentile(95.0) / 1_000_000.0
-                    p99_ms = self.write_interval_histogram.get_value_at_percentile(99.0) / 1_000_000.0
-                    p999_ms = self.write_interval_histogram.get_value_at_percentile(99.9) / 1_000_000.0
-                    max_ms = self.write_interval_histogram.get_max_value() / 1_000_000.0
-                else:
-                    mean_ms = self.read_interval_histogram.get_mean_value() / 1_000_000.0
-                    median_ms = self.read_interval_histogram.get_value_at_percentile(50.0) / 1_000_000.0
-                    p95_ms = self.read_interval_histogram.get_value_at_percentile(95.0) / 1_000_000.0
-                    p99_ms = self.read_interval_histogram.get_value_at_percentile(99.0) / 1_000_000.0
-                    p999_ms = self.read_interval_histogram.get_value_at_percentile(99.9) / 1_000_000.0
-                    max_ms = self.read_interval_histogram.get_max_value() / 1_000_000.0
-
-                # Reset interval histograms
-                self.write_interval_histogram.reset()
-                self.read_interval_histogram.reset()
-
-            # Print header once
-            if not self.stats_header_printed:
-                print(
-                    f"{'total ops':>10}, {'op/s':>8}, {'mean':>6}, {'med':>7}, {'.95':>7}, "
-                    f"{'.99':>7}, {'.999':>7}, {'max':>7}, {'time':>6}, {'errors':>7}"
-                )
-                self.stats_header_printed = True
-
-            total_ops = self.total_write_ops + self.total_read_ops
-
-            # Print interval stats
-            print(
-                f"{total_ops:>10}, {ops_per_sec:>8.0f}, {mean_ms:>6.1f}, {median_ms:>7.1f}, "
-                f"{p95_ms:>7.1f}, {p99_ms:>7.1f}, {p999_ms:>7.1f}, {max_ms:>7.1f}, "
-                f"{elapsed_time:>6.1f}, {self.interval_errors:>7}"
-            )
-
-            # Reset interval counters
-            self.write_interval_ops = 0
-            self.read_interval_ops = 0
-            self.interval_errors = 0
-            self.last_interval_time = elapsed_time
-
-    def _print_op_summary(self, op_type, histogram, duration, ops):
+    @staticmethod
+    def _print_op_summary(op_type, histogram, duration, ops):
         """Print summary for a single operation type."""
         op_rate = ops / duration if duration > 0 else 0
 
-        # Convert nanoseconds to milliseconds for display
-        if histogram.get_total_count() > 0:
+        if histogram and histogram.get_total_count() > 0:
             latency_mean = histogram.get_mean_value() / 1_000_000.0
             latency_median = histogram.get_value_at_percentile(50.0) / 1_000_000.0
             latency_p95 = histogram.get_value_at_percentile(95.0) / 1_000_000.0
@@ -1183,29 +1617,23 @@ Latency 99th percentile   :  {latency_p99:.1f} ms [{op_type}: {latency_p99:.1f} 
 Latency 99.9th percentile :  {latency_p999:.1f} ms [{op_type}: {latency_p999:.1f} ms]
 Latency max               :  {latency_max:.1f} ms [{op_type}: {latency_max:.1f} ms]""")
 
-    def _get_histogram_stats(self, histogram):
-        """Extract latency stats from histogram as dict (values in ms)."""
-        if histogram.get_total_count() > 0:
-            return {
-                "mean": histogram.get_mean_value() / 1_000_000.0,
-                "median": histogram.get_value_at_percentile(50.0) / 1_000_000.0,
-                "p95": histogram.get_value_at_percentile(95.0) / 1_000_000.0,
-                "p99": histogram.get_value_at_percentile(99.0) / 1_000_000.0,
-                "p999": histogram.get_value_at_percentile(99.9) / 1_000_000.0,
-                "max": histogram.get_max_value() / 1_000_000.0,
-                "count": histogram.get_total_count(),
-            }
-        return {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "p999": 0.0, "max": 0.0, "count": 0}
-
-    def _print_mixed_summary(self, duration):
+    def _print_mixed_summary(self, write_hist, read_hist, total_write_ops, total_read_ops, duration):
         """Print combined summary for mixed workload matching cassandra-stress format."""
-        total_ops = self.total_write_ops + self.total_read_ops
+        total_ops = total_write_ops + total_read_ops
         total_rate = total_ops / duration if duration > 0 else 0
-        write_rate = self.total_write_ops / duration if duration > 0 else 0
-        read_rate = self.total_read_ops / duration if duration > 0 else 0
+        write_rate = total_write_ops / duration if duration > 0 else 0
+        read_rate = total_read_ops / duration if duration > 0 else 0
 
-        w = self._get_histogram_stats(self.write_summary_histogram)
-        r = self._get_histogram_stats(self.read_summary_histogram)
+        w = (
+            self._get_histogram_stats(write_hist)
+            if write_hist
+            else {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "p999": 0.0, "max": 0.0, "count": 0}
+        )
+        r = (
+            self._get_histogram_stats(read_hist)
+            if read_hist
+            else {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "p999": 0.0, "max": 0.0, "count": 0}
+        )
         total_count = w["count"] + r["count"]
 
         # Calculate combined latencies (weighted average)
@@ -1221,7 +1649,6 @@ Latency max               :  {latency_max:.1f} ms [{op_type}: {latency_max:.1f} 
         else:
             combined = {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "p999": 0.0, "max": 0.0}
 
-        # Print in cassandra-stress format
         print(f"""\
 Op rate                   : {total_rate:,.0f} op/s  [READ: {read_rate:,.0f} op/s, WRITE: {write_rate:,.0f} op/s]
 Latency mean              :  {combined["mean"]:.1f} ms [READ: {r["mean"]:.1f} ms, WRITE: {w["mean"]:.1f} ms]
@@ -1230,23 +1657,6 @@ Latency 95th percentile   :  {combined["p95"]:.1f} ms [READ: {r["p95"]:.1f} ms, 
 Latency 99th percentile   :  {combined["p99"]:.1f} ms [READ: {r["p99"]:.1f} ms, WRITE: {w["p99"]:.1f} ms]
 Latency 99.9th percentile :  {combined["p999"]:.1f} ms [READ: {r["p999"]:.1f} ms, WRITE: {w["p999"]:.1f} ms]
 Latency max               :  {combined["max"]:,.1f} ms [READ: {r["max"]:,.1f} ms, WRITE: {w["max"]:,.1f} ms]""")
-
-    def print_summary(self, duration, ops):
-        # Format duration as HH:MM:SS
-        hours, remainder = divmod(int(duration), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-        print("\nResults:")
-
-        if self.config.command == "write":
-            self._print_op_summary("WRITE", self.write_summary_histogram, duration, self.total_write_ops)
-        elif self.config.command == "read":
-            self._print_op_summary("READ", self.read_summary_histogram, duration, self.total_read_ops)
-        else:  # mixed
-            self._print_mixed_summary(duration)
-
-        print(f"Total operation time      : {duration_str}")
 
 
 if __name__ == "__main__":
