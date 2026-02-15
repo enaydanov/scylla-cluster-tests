@@ -175,6 +175,19 @@
     - Prints separate statistics for READ and WRITE operations
     - Uses accumulated summary histograms
 
+### 13. Add Support for `ratio(write=N,read=M)` Option
+- **Objective**: Allow configuring the read/write ratio for mixed workloads.
+- **Details**:
+  - Parse `ratio(write=N,read=M)` syntax after `mixed` command
+  - Default ratio is 1:1 (50% writes, 50% reads)
+  - Ratio determines probability of selecting write vs read operation
+  - Order of write/read in ratio string doesn't matter
+  - Case-insensitive parsing
+  - Examples:
+    - `mixed 'ratio(write=1,read=1)'` - 50% writes, 50% reads (default)
+    - `mixed 'ratio(write=1,read=2)'` - 33% writes, 67% reads
+    - `mixed 'ratio(read=3,write=1)'` - 25% writes, 75% reads
+
 ### 14. Nanosecond Latency Storage (cassandra-stress compatibility)
 - **Objective**: Store latency values in nanoseconds to match cassandra-stress implementation.
 - **Details**:
@@ -188,18 +201,32 @@
     - Higher precision for sub-microsecond latencies
     - Easier comparison when analyzing HDR files from both tools
 
-### 13. Add Support for `ratio(write=N,read=M)` Option
-- **Objective**: Allow configuring the read/write ratio for mixed workloads.
+### 15. Code Architecture and Maintainability
+- **Objective**: Keep code maintainable and compliant with linting rules.
 - **Details**:
-  - Parse `ratio(write=N,read=M)` syntax after `mixed` command
-  - Default ratio is 1:1 (50% writes, 50% reads)
-  - Ratio determines probability of selecting write vs read operation
-  - Order of write/read in ratio string doesn't matter
-  - Case-insensitive parsing
-  - Examples:
-    - `mixed 'ratio(write=1,read=1)'` - 50% writes, 50% reads (default)
-    - `mixed 'ratio(write=1,read=2)'` - 33% writes, 67% reads
-    - `mixed 'ratio(read=3,write=1)'` - 25% writes, 75% reads
+  - **CLI Parsing** - Modular helper functions for each flag type:
+    - `_parse_key_value_arg()` - handles `n=`, `duration=`, `cl=` args
+    - `_parse_rate_args()` - handles `-rate` flag
+    - `_parse_col_args()` - handles `-col` flag
+    - `_parse_schema_args()` - handles `-schema` flag
+    - `_parse_pop_args()` - handles `-pop` flag
+    - `_parse_log_args()` - handles `-log` flag
+    - `_parse_mode_arg()` - handles `-mode` flag options
+  - **Workload Execution** - Separated concerns:
+    - `_create_key_generator()` - creates key generator based on distribution config
+    - `_run_workload()` - orchestrates workload execution
+    - `_execute_operations()` - inner operation submission loop
+    - `_record_latency()` - records latency to histograms
+    - `_record_error()` - records operation errors
+  - **Statistics and Output**:
+    - `_get_histogram_stats()` - extracts stats from histogram as dict
+    - `_print_op_summary()` - prints single operation type summary
+    - `_print_mixed_summary()` - prints mixed workload summary
+    - `print_interval_stats()` - prints periodic interval statistics
+  - **Error Handling** - Specific exception types instead of blind catches:
+    - `OSError` for file/network operations
+    - `RuntimeError` for execution failures
+    - `ValueError` for data conversion issues
 
 ---
 

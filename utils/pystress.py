@@ -37,6 +37,7 @@ from datetime import datetime
 
 from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.policies import TokenAwarePolicy, DCAwareRoundRobinPolicy
+from cassandra.auth import PlainTextAuthProvider
 from cassandra import ConsistencyLevel
 from hdrh.histogram import HdrHistogram
 from hdrh.log import HistogramLogWriter
@@ -372,6 +373,117 @@ def parse_ratio_option(ratio_str):
     return result
 
 
+def _parse_key_value_arg(config, key, val):
+    """Parse a key=value argument and update config."""
+    if key == "n":
+        config.num_operations = parse_metric_suffix(val)
+    elif key == "duration":
+        config.duration = parse_duration(val)
+    elif key == "cl":
+        try:
+            config.consistency_level = getattr(ConsistencyLevel, val.upper())
+        except AttributeError:
+            logger.warning(f"Unknown CL {val}, defaulting to ONE")
+
+
+def _parse_rate_args(config, args, start_idx):
+    """Parse -rate arguments, returns next index to process."""
+    i = start_idx
+    while i < len(args) and not args[i].startswith("-"):
+        rate_arg = args[i]
+        parts = rate_arg.replace(",", " ").split()
+        for part in parts:
+            if "threads=" in part:
+                config.threads = int(part.split("=")[1])
+            elif "throttle=" in part:
+                val = part.split("=")[1]
+                if val.endswith("/s"):
+                    config.throttle = float(val[:-2])
+                else:
+                    logger.warning(f"Ignoring throttle value '{val}': only 'N/s' format is supported")
+        i += 1
+    return i
+
+
+def _parse_col_args(config, args, start_idx):
+    """Parse -col arguments, returns next index to process."""
+    i = start_idx
+    while i < len(args) and not args[i].startswith("-"):
+        col_arg = args[i]
+        for part in col_arg.split():
+            if "size=" in part:
+                _, val = part.split("size=", 1)
+                dist = parse_distribution(val)
+                if dist:
+                    config.col_size_dist = dist
+                    if dist["type"] == "FIXED":
+                        config.col_size = dist["value"]
+                    elif dist["type"] == "UNIFORM":
+                        config.col_size = dist["max"]
+            if "n=" in part:
+                _, val = part.split("n=", 1)
+                dist = parse_distribution(val)
+                if dist:
+                    config.col_count_dist = dist
+                    if dist["type"] == "FIXED":
+                        config.col_count = dist["value"]
+                    elif dist["type"] == "UNIFORM":
+                        config.col_count = dist["max"]
+        i += 1
+    return i
+
+
+def _parse_schema_args(config, args, start_idx):
+    """Parse -schema arguments, returns next index to process."""
+    i = start_idx
+    schema_parts = []
+    while i < len(args) and not args[i].startswith("-"):
+        schema_parts.append(args[i])
+        i += 1
+    if schema_parts:
+        schema_str = " ".join(schema_parts)
+        parsed = parse_schema_option(schema_str)
+        config.keyspace_name = parsed["keyspace"]
+        config.replication_strategy = parsed["replication_strategy"]
+        config.replication_factor = parsed["replication_factor"]
+        config.compaction_strategy = parsed["compaction_strategy"]
+        config.compression = parsed["compression"]
+    return i
+
+
+def _parse_pop_args(config, args, start_idx):
+    """Parse -pop arguments, returns next index to process."""
+    i = start_idx
+    pop_parts = []
+    while i < len(args) and not args[i].startswith("-"):
+        pop_parts.append(args[i])
+        i += 1
+    if pop_parts:
+        pop_str = " ".join(pop_parts)
+        parsed = parse_pop_distribution(pop_str)
+        config.pop_dist = parsed["type"]
+        config.pop_min = parsed["min"]
+        config.pop_max = parsed["max"]
+        config.pop_mean = parsed["mean"]
+        config.pop_stdev = parsed["stdev"]
+    return i
+
+
+def _parse_log_args(config, args, start_idx):
+    """Parse -log arguments, returns next index to process."""
+    i = start_idx
+    while i < len(args) and not args[i].startswith("-"):
+        log_arg = args[i]
+        parts = log_arg.replace(",", " ").split()
+        for part in parts:
+            if "hdrfile=" in part:
+                config.output_file = part.split("=", 1)[1]
+            elif "interval=" in part:
+                config.log_interval = parse_interval(part.split("=", 1)[1])
+        i += 1
+    return i
+
+
 def parse_cli_args(args):
     """
     Parses cassandra-stress style arguments manually since argparse
@@ -394,7 +506,7 @@ def parse_cli_args(args):
 
     i = 1
 
-    # Check for ratio option immediately after mixed command (e.g., mixed 'ratio(write=1,read=2)')
+    # Check for ratio option immediately after mixed command
     if config.command == "mixed" and i < len(args) and "ratio(" in args[i].lower():
         parsed_ratio = parse_ratio_option(args[i])
         config.ratio_write = parsed_ratio["write"]
@@ -407,144 +519,31 @@ def parse_cli_args(args):
         # Handle key=value args
         if "=" in arg and not arg.startswith("-"):
             key, val = arg.split("=", 1)
-            if key == "n":
-                config.num_operations = parse_metric_suffix(val)
-            elif key == "duration":
-                config.duration = parse_duration(val)
-            elif key == "cl":
-                try:
-                    config.consistency_level = getattr(ConsistencyLevel, val.upper())
-                except AttributeError:
-                    logger.warning(f"Unknown CL {val}, defaulting to ONE")
-            # Ignore other kv args for simplicity in this scaffold
+            _parse_key_value_arg(config, key, val)
             i += 1
             continue
 
         # Handle standard flags
         if arg == "-rate":
-            i += 1
-            if i < len(args):
-                rate_arg = args[i]
-                # If rate_arg does not contain commas but we expect multiple options, it might be space separated in one arg or multiple args?
-                # Usually cassandra-stress takes -rate threads=N,throttle=N...
-                # But sometimes users might pass -rate threads=N throttle=N if they didn't quote correctly or if it consumes adjacent args.
-                # However, parse_cli_args iterates args.
-
-                # If the user did "-rate threads=10 throttle=50/s" (two separate args), our loop structure handles distinct key=value args, but flags expect one value usually?
-                # Actually, cassandra-stress options usually consume until next main flag.
-
-                # Let's adjust to consume multiple sub-arguments for -rate similar to -mode or -col which consume multiple tokens.
-                while i < len(args) and not args[i].startswith("-"):
-                    rate_arg = args[i]
-                    # It might be comma separated inside one chunk: "threads=50,throttle=100/s"
-                    parts = rate_arg.replace(",", " ").split()
-                    for part in parts:
-                        if "threads=" in part:
-                            config.threads = int(part.split("=")[1])
-                        elif "throttle=" in part:
-                            val = part.split("=")[1]
-                            if val.endswith("/s"):
-                                config.throttle = float(val[:-2])
-                            else:
-                                logger.warning(f"Ignoring throttle value '{val}': only 'N/s' format is supported")
-                    i += 1
-                # The outer loop increments i at the end, but we already consumed everything for -rate.
-                # Since we used a while loop to consume non-flag args, current args[i] starts with "-" or we are at end.
-                # The outer loop logic is:
-                # while i < len(args):
-                #   arg = args[i]
-                #   ... checks ...
-                #   increment i for next iteration
-
-                # If we use a while loop inside, `i` points to the next flag or len(args).
-                # We should NOT increment `i` again in the outer logic for this block if we already advanced it correctly.
-                # But existing structure is `elif ... i+=1`.
-
-                # Let's rewrite the -rate block to match the structure of -mode and -col which consume multiple tokens.
-                continue
-
+            i = _parse_rate_args(config, args, i + 1)
         elif arg == "-node":
             i += 1
             if i < len(args):
                 config.nodes = args[i].split(",")
             i += 1
-
         elif arg == "-col":
-            i += 1
-            # Consume arguments until next flag
-            while i < len(args) and not args[i].startswith("-"):
-                col_arg = args[i]
-                for part in col_arg.split():  # handle 'size=FIXED(1024) n=FIXED(1)'
-                    if "size=" in part:
-                        _, val = part.split("size=", 1)
-                        dist = parse_distribution(val)
-                        if dist:
-                            config.col_size_dist = dist
-                            if dist["type"] == "FIXED":
-                                config.col_size = dist["value"]
-                            elif dist["type"] == "UNIFORM":
-                                config.col_size = dist["max"]  # Use max for buffering/schema
-
-                    if "n=" in part:
-                        _, val = part.split("n=", 1)
-                        dist = parse_distribution(val)
-                        if dist:
-                            config.col_count_dist = dist
-                            if dist["type"] == "FIXED":
-                                config.col_count = dist["value"]
-                            elif dist["type"] == "UNIFORM":
-                                config.col_count = dist["max"]  # Use max for schema
-                i += 1
-
+            i = _parse_col_args(config, args, i + 1)
         elif arg == "-schema":
-            i += 1
-            schema_parts = []
-            while i < len(args) and not args[i].startswith("-"):
-                schema_parts.append(args[i])
-                i += 1
-            if schema_parts:
-                schema_str = " ".join(schema_parts)
-                parsed = parse_schema_option(schema_str)
-                config.keyspace_name = parsed["keyspace"]
-                config.replication_strategy = parsed["replication_strategy"]
-                config.replication_factor = parsed["replication_factor"]
-                config.compaction_strategy = parsed["compaction_strategy"]
-                config.compression = parsed["compression"]
-
+            i = _parse_schema_args(config, args, i + 1)
         elif arg == "-pop":
-            i += 1
-            pop_parts = []
-            while i < len(args) and not args[i].startswith("-"):
-                pop_parts.append(args[i])
-                i += 1
-            if pop_parts:
-                pop_str = " ".join(pop_parts)
-                parsed = parse_pop_distribution(pop_str)
-                config.pop_dist = parsed["type"]
-                config.pop_min = parsed["min"]
-                config.pop_max = parsed["max"]
-                config.pop_mean = parsed["mean"]
-                config.pop_stdev = parsed["stdev"]
-
+            i = _parse_pop_args(config, args, i + 1)
         elif arg == "-log":
-            i += 1
-            while i < len(args) and not args[i].startswith("-"):
-                log_arg = args[i]
-                parts = log_arg.replace(",", " ").split()
-                for part in parts:
-                    if "hdrfile=" in part:
-                        config.output_file = part.split("=", 1)[1]
-                    elif "interval=" in part:
-                        config.log_interval = parse_interval(part.split("=", 1)[1])
-                i += 1
-
+            i = _parse_log_args(config, args, i + 1)
         elif arg == "-mode":
             i += 1
             while i < len(args) and not args[i].startswith("-"):
-                mode_part = args[i]
-                _parse_mode_arg(config, mode_part)
+                _parse_mode_arg(config, args[i])
                 i += 1
-
         else:
             # Skip unknown
             i += 1
@@ -699,8 +698,6 @@ class CassandraStressPy:
 
         auth_provider = None
         if self.config.user and self.config.password:
-            from cassandra.auth import PlainTextAuthProvider
-
             auth_provider = PlainTextAuthProvider(username=self.config.user, password=self.config.password)
 
         profile = ExecutionProfile(
@@ -801,152 +798,147 @@ class CassandraStressPy:
         # cassandra-stress keys are blobs, often string reps of numbers
         return str(idx).encode("utf-8")
 
-    def run(self):
-        self.connect()
-        # Only setup schema if writing? Or assume it exists for read?
-        # cassandra-stress usually ensures schema unless specified otherwise.
-        # We will attempt schema setup.
-        try:
-            self.setup_schema()
-        except Exception as e:
-            logger.error(f"Schema setup failed; aborting run: {e}")
-            return
-
-        ops_total = self.config.num_operations
-        threads = self.config.threads
-
-        logger.info(
-            f"Starting {self.config.command} workload: {ops_total} ops, {threads} threads, "
-            f"CL={self.config.consistency_level}, ColSize={self.config.col_size}, ColCount={self.config.col_count}"
-        )
-
-        start_time = time.perf_counter()
-        self.start_timestamp = time.time() * 1000  # Epoch milliseconds for HDR file header
-
-        # Initialize HDR file writer
-        self._init_hdr_writer()
-
-        # Generator for keys based on population distribution
+    def _create_key_generator(self):
+        """Create a key generator based on population distribution config."""
         if self.config.pop_dist == "gaussian":
             mean = self.config.pop_mean
             stdev = self.config.pop_stdev
+            pop_min = self.config.pop_min
+            pop_max = self.config.pop_max
 
             def key_gen():
                 while True:
-                    # Generate gaussian value and clamp to [min, max]
                     val = random.gauss(mean, stdev)
                     val = int(round(val))
-                    val = max(self.config.pop_min, min(self.config.pop_max, val))
+                    val = max(pop_min, min(pop_max, val))
                     yield val
 
-        elif self.config.pop_dist == "uniform":
+            return key_gen()
+
+        if self.config.pop_dist == "uniform":
 
             def key_gen():
                 while True:
                     yield random.randint(self.config.pop_min, self.config.pop_max)
 
-        else:
-            # Sequential (default)
-            def key_gen():
-                idx = self.config.pop_min
-                while True:
-                    yield idx
-                    idx += 1
-                    if idx > self.config.pop_max:
-                        idx = self.config.pop_min  # wrap around
+            return key_gen()
 
-        keys = key_gen()
+        # Sequential (default)
+        def key_gen():
+            idx = self.config.pop_min
+            while True:
+                yield idx
+                idx += 1
+                if idx > self.config.pop_max:
+                    idx = self.config.pop_min
 
-        # We prepare the payload args once if they are same every time (random data not supported properly yet)
-        # For multiple columns, we need a list of payloads
-        # Optimization: if everything is fixed, precompute args
+        return key_gen()
+
+    def _record_latency(self, op_type, latency_nanos):
+        """Record latency value to appropriate histograms."""
+        with self.histogram_lock:
+            if op_type == "write":
+                self.write_summary_histogram.record_value(latency_nanos)
+                self.write_interval_histogram.record_value(latency_nanos)
+            else:
+                self.read_summary_histogram.record_value(latency_nanos)
+                self.read_interval_histogram.record_value(latency_nanos)
+        with self.stats_lock:
+            if op_type == "write":
+                self.write_interval_ops += 1
+                self.total_write_ops += 1
+            else:
+                self.read_interval_ops += 1
+                self.total_read_ops += 1
+
+    def _record_error(self):
+        """Record an operation error."""
+        with self.stats_lock:
+            self.interval_errors += 1
+            self.total_errors += 1
+
+    def _run_workload(self, start_time, threads):  # noqa: PLR0914, PLR0915
+        """Execute the main workload loop."""
         fixed_payloads = None
         if self.config.col_size_dist["type"] == "FIXED" and self.config.col_count_dist["type"] == "FIXED":
             fixed_payloads = [self._payload_cache for _ in range(self.config.col_count)]
 
         sessions_count = len(self.sessions)
-        session_index_lock = threading.Lock()
-        session_index = 0
+        session_lock = threading.Lock()
+        session_idx = [0]  # Use list for nonlocal mutation
+        keys = self._create_key_generator()
 
         end_time = start_time + self.config.duration if self.config.duration else None
-
-        # Rate limiting variables
         throttle_delay = 1.0 / self.config.throttle if self.config.throttle else 0
-        next_op_time = start_time
-
-        # Interval stats tracking
         self.last_interval_time = 0
+
+        def on_done(f, op_type):
+            try:
+                self._record_latency(op_type, f.result())
+            except (OSError, RuntimeError, ValueError) as e:
+                logger.error(f"Op failed: {e}")
+                self._record_error()
+
+        def pick_session():
+            with session_lock:
+                idx = session_idx[0]
+                session_idx[0] = (idx + 1) % sessions_count
+            return idx
+
+        def do_write(key_int, sidx):
+            payloads = fixed_payloads if fixed_payloads else self._generate_payloads()
+            args = [self._generate_key(key_int)] + payloads
+            t0 = time.perf_counter()
+            self.sessions[sidx].execute(self.prepared_writes[sidx], args)
+            return int((time.perf_counter() - t0) * 1_000_000_000)
+
+        def do_read(key_int, sidx):
+            t0 = time.perf_counter()
+            self.sessions[sidx].execute(self.prepared_reads[sidx], (self._generate_key(key_int),))
+            return int((time.perf_counter() - t0) * 1_000_000_000)
+
+        is_mixed = self.config.command == "mixed"
+        default_task = do_write if self.config.command == "write" else do_read
+        ratio_write = self.config.ratio_write / (self.config.ratio_write + self.config.ratio_read)
+
+        return self._execute_operations(
+            threads,
+            keys,
+            end_time,
+            throttle_delay,
+            start_time,
+            is_mixed,
+            default_task,
+            do_write,
+            do_read,
+            ratio_write,
+            pick_session,
+            on_done,
+        )
+
+    def _execute_operations(
+        self,
+        threads,
+        keys,
+        end_time,
+        throttle_delay,
+        start_time,
+        is_mixed,
+        default_task,
+        do_write,
+        do_read,
+        ratio_write,
+        pick_session,
+        on_done,
+    ):  # noqa: PLR0913
+        """Execute the operation submission loop."""
+        next_op_time = start_time
         next_interval_time = start_time + self.config.log_interval
+        max_pending = threads * 50
 
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = []
             submitted = 0
-
-            # Helper to process result with operation type
-            def on_done(f, op_type):
-                try:
-                    latency_nanos = f.result()
-                    with self.histogram_lock:
-                        if op_type == "write":
-                            self.write_summary_histogram.record_value(latency_nanos)
-                            self.write_interval_histogram.record_value(latency_nanos)
-                        else:
-                            self.read_summary_histogram.record_value(latency_nanos)
-                            self.read_interval_histogram.record_value(latency_nanos)
-                    with self.stats_lock:
-                        if op_type == "write":
-                            self.write_interval_ops += 1
-                            self.total_write_ops += 1
-                        else:
-                            self.read_interval_ops += 1
-                            self.total_read_ops += 1
-                except Exception as e:
-                    logger.error(f"Op failed: {e}")
-                    with self.stats_lock:
-                        self.interval_errors += 1
-                        self.total_errors += 1
-
-            def pick_session_index():
-                nonlocal session_index
-                with session_index_lock:
-                    idx = session_index
-                    session_index = (session_index + 1) % sessions_count
-                return idx
-
-            # Define task
-            def do_write(key_int, session_idx):
-                # construct args: key + [payloads...]
-                if fixed_payloads:
-                    current_payloads = fixed_payloads
-                else:
-                    current_payloads = self._generate_payloads()
-
-                args = [self._generate_key(key_int)] + current_payloads
-
-                t0 = time.perf_counter()
-                self.sessions[session_idx].execute(self.prepared_writes[session_idx], args)
-                return int((time.perf_counter() - t0) * 1_000_000_000)  # nanoseconds
-
-            def do_read(key_int, session_idx):
-                args = (self._generate_key(key_int),)
-
-                t0 = time.perf_counter()
-                self.sessions[session_idx].execute(self.prepared_reads[session_idx], args)
-                return int((time.perf_counter() - t0) * 1_000_000_000)  # nanoseconds
-
-            # Determine operation type for callbacks
-            if self.config.command == "write":
-                op_type = "write"
-            elif self.config.command == "read":
-                op_type = "read"
-            else:
-                op_type = "mixed"  # Will be determined per-operation
-
-            task = do_write if self.config.command == "write" else do_read
-
-            # Main Loop - Submit tasks
-            # To avoid exploding memory with millions of futures, we control the queue depth
-            max_pending = threads * 50
 
             while True:
                 now = time.perf_counter()
@@ -955,79 +947,74 @@ class CassandraStressPy:
                 if not self.config.duration and submitted >= self.config.num_operations:
                     break
 
-                # Rate limiting
                 if throttle_delay > 0:
                     if now < next_op_time:
-                        sleep_time = next_op_time - now
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
-                        next_op_time += throttle_delay
-                    else:
-                        # We are behind schedule or just starting.
-                        # Do not try to burst catch up too much if we are very far behind?
-                        # For simple limiting, we just set next op time.
-                        # To avoid drift, we increment from next_op_time, but if we fall way behind
-                        # (e.g. system pause), we might reset to now.
-                        # Simple implementation:
-                        next_op_time = max(next_op_time + throttle_delay, now + throttle_delay)
+                        time.sleep(next_op_time - now)
+                    next_op_time = max(next_op_time + throttle_delay, now + throttle_delay)
 
                 try:
                     k = next(keys)
                 except StopIteration:
                     break
 
-                idx = pick_session_index()
-
-                # For mixed workload, select based on configured ratio
-                if op_type == "mixed":
-                    total_ratio = self.config.ratio_write + self.config.ratio_read
-                    if random.random() < (self.config.ratio_write / total_ratio):
-                        current_op_type = "write"
-                        current_task = do_write
-                    else:
-                        current_op_type = "read"
-                        current_task = do_read
+                idx = pick_session()
+                if is_mixed:
+                    op_type = "write" if random.random() < ratio_write else "read"
+                    task = do_write if op_type == "write" else do_read
                 else:
-                    current_op_type = op_type
-                    current_task = task
+                    op_type = self.config.command
+                    task = default_task
 
-                f = executor.submit(current_task, k, idx)
-                # Use functools.partial-like binding via lambda with default arg capture
-                f.add_done_callback(lambda fut, ot=current_op_type: on_done(fut, ot))
+                f = executor.submit(task, k, idx)
+                f.add_done_callback(lambda fut, ot=op_type: on_done(fut, ot))
                 futures.append(f)
                 submitted += 1
 
                 if len(futures) >= max_pending:
-                    # Prune finished futures
                     futures = [fut for fut in futures if not fut.done()]
-                    # if still full, sleep a bit
                     while len(futures) >= max_pending:
                         time.sleep(0.005)
                         futures = [fut for fut in futures if not fut.done()]
 
-                # Print interval stats periodically
-                now = time.perf_counter()
-                if now >= next_interval_time:
-                    elapsed = now - start_time
+                if time.perf_counter() >= next_interval_time:
+                    elapsed = time.perf_counter() - start_time
                     self._output_interval_histograms(elapsed)
                     self.print_interval_stats(elapsed)
-                    next_interval_time = now + self.config.log_interval
+                    next_interval_time = time.perf_counter() + self.config.log_interval
 
-            # Wait for remaining
             logger.info("Waiting for pending tasks...")
             for f in futures:
                 try:
                     f.result()
-                except Exception:
-                    pass  # Handled in callback
+                except (OSError, RuntimeError, ValueError):
+                    pass
+
+        return submitted
+
+    def run(self):
+        self.connect()
+        try:
+            self.setup_schema()
+        except (OSError, RuntimeError) as e:
+            logger.error(f"Schema setup failed; aborting run: {e}")
+            return
+
+        threads = self.config.threads
+        logger.info(
+            f"Starting {self.config.command} workload: {self.config.num_operations} ops, {threads} threads, "
+            f"CL={self.config.consistency_level}, ColSize={self.config.col_size}, ColCount={self.config.col_count}"
+        )
+
+        start_time = time.perf_counter()
+        self.start_timestamp = time.time() * 1000  # Epoch milliseconds for HDR file header
+        self._init_hdr_writer()
+
+        submitted = self._run_workload(start_time, threads)
 
         total_duration = time.perf_counter() - start_time
-
-        # Output final interval stats (for any remaining data not yet output)
         self._output_interval_histograms(total_duration)
         self.print_interval_stats(total_duration)
 
-        print("\nDone.")
         self.save_hdr()
         self.print_summary(total_duration, submitted)
         for cluster in self.clusters:
@@ -1045,7 +1032,7 @@ class CassandraStressPy:
             self.hdr_writer.output_base_time(self.start_timestamp)
             self.hdr_writer.output_start_time(self.start_timestamp)
             self.hdr_writer.output_legend()
-        except Exception as e:
+        except OSError as e:
             logger.error(f"Failed to initialize HDR file: {e}")
             self.hdr_file = None
             self.hdr_writer = None
@@ -1080,7 +1067,7 @@ class CassandraStressPy:
             try:
                 self.hdr_file.close()
                 logger.info(f"HDR histogram saved to {self.config.output_file}")
-            except Exception as e:
+            except OSError as e:
                 logger.error(f"Failed to close HDR file: {e}")
 
     def print_interval_stats(self, elapsed_time):
@@ -1187,13 +1174,28 @@ class CassandraStressPy:
         else:
             latency_mean = latency_median = latency_p95 = latency_p99 = latency_p999 = latency_max = 0.0
 
-        print(f"Op rate                   : {op_rate:,.0f} op/s  [{op_type}: {op_rate:,.0f} op/s]")
-        print(f"Latency mean              :  {latency_mean:.1f} ms [{op_type}: {latency_mean:.1f} ms]")
-        print(f"Latency median            :  {latency_median:.1f} ms [{op_type}: {latency_median:.1f} ms]")
-        print(f"Latency 95th percentile   :  {latency_p95:.1f} ms [{op_type}: {latency_p95:.1f} ms]")
-        print(f"Latency 99th percentile   :  {latency_p99:.1f} ms [{op_type}: {latency_p99:.1f} ms]")
-        print(f"Latency 99.9th percentile :  {latency_p999:.1f} ms [{op_type}: {latency_p999:.1f} ms]")
-        print(f"Latency max               :  {latency_max:.1f} ms [{op_type}: {latency_max:.1f} ms]")
+        print(f"""\
+Op rate                   : {op_rate:,.0f} op/s  [{op_type}: {op_rate:,.0f} op/s]
+Latency mean              :  {latency_mean:.1f} ms [{op_type}: {latency_mean:.1f} ms]
+Latency median            :  {latency_median:.1f} ms [{op_type}: {latency_median:.1f} ms]
+Latency 95th percentile   :  {latency_p95:.1f} ms [{op_type}: {latency_p95:.1f} ms]
+Latency 99th percentile   :  {latency_p99:.1f} ms [{op_type}: {latency_p99:.1f} ms]
+Latency 99.9th percentile :  {latency_p999:.1f} ms [{op_type}: {latency_p999:.1f} ms]
+Latency max               :  {latency_max:.1f} ms [{op_type}: {latency_max:.1f} ms]""")
+
+    def _get_histogram_stats(self, histogram):
+        """Extract latency stats from histogram as dict (values in ms)."""
+        if histogram.get_total_count() > 0:
+            return {
+                "mean": histogram.get_mean_value() / 1_000_000.0,
+                "median": histogram.get_value_at_percentile(50.0) / 1_000_000.0,
+                "p95": histogram.get_value_at_percentile(95.0) / 1_000_000.0,
+                "p99": histogram.get_value_at_percentile(99.0) / 1_000_000.0,
+                "p999": histogram.get_value_at_percentile(99.9) / 1_000_000.0,
+                "max": histogram.get_max_value() / 1_000_000.0,
+                "count": histogram.get_total_count(),
+            }
+        return {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "p999": 0.0, "max": 0.0, "count": 0}
 
     def _print_mixed_summary(self, duration):
         """Print combined summary for mixed workload matching cassandra-stress format."""
@@ -1202,66 +1204,32 @@ class CassandraStressPy:
         write_rate = self.total_write_ops / duration if duration > 0 else 0
         read_rate = self.total_read_ops / duration if duration > 0 else 0
 
-        # Get stats from both histograms
-        write_hist = self.write_summary_histogram
-        read_hist = self.read_summary_histogram
-        write_count = write_hist.get_total_count()
-        read_count = read_hist.get_total_count()
-
-        # Calculate individual latencies (in ms, converting from nanoseconds)
-        if write_count > 0:
-            write_mean = write_hist.get_mean_value() / 1_000_000.0
-            write_median = write_hist.get_value_at_percentile(50.0) / 1_000_000.0
-            write_p95 = write_hist.get_value_at_percentile(95.0) / 1_000_000.0
-            write_p99 = write_hist.get_value_at_percentile(99.0) / 1_000_000.0
-            write_p999 = write_hist.get_value_at_percentile(99.9) / 1_000_000.0
-            write_max = write_hist.get_max_value() / 1_000_000.0
-        else:
-            write_mean = write_median = write_p95 = write_p99 = write_p999 = write_max = 0.0
-
-        if read_count > 0:
-            read_mean = read_hist.get_mean_value() / 1_000_000.0
-            read_median = read_hist.get_value_at_percentile(50.0) / 1_000_000.0
-            read_p95 = read_hist.get_value_at_percentile(95.0) / 1_000_000.0
-            read_p99 = read_hist.get_value_at_percentile(99.0) / 1_000_000.0
-            read_p999 = read_hist.get_value_at_percentile(99.9) / 1_000_000.0
-            read_max = read_hist.get_max_value() / 1_000_000.0
-        else:
-            read_mean = read_median = read_p95 = read_p99 = read_p999 = read_max = 0.0
+        w = self._get_histogram_stats(self.write_summary_histogram)
+        r = self._get_histogram_stats(self.read_summary_histogram)
+        total_count = w["count"] + r["count"]
 
         # Calculate combined latencies (weighted average)
-        if write_count + read_count > 0:
-            combined_mean = (write_mean * write_count + read_mean * read_count) / (write_count + read_count)
-            combined_median = (write_median * write_count + read_median * read_count) / (write_count + read_count)
-            combined_p95 = (write_p95 * write_count + read_p95 * read_count) / (write_count + read_count)
-            combined_p99 = (write_p99 * write_count + read_p99 * read_count) / (write_count + read_count)
-            combined_p999 = (write_p999 * write_count + read_p999 * read_count) / (write_count + read_count)
-            combined_max = max(write_max, read_max)
+        if total_count > 0:
+            combined = {
+                "mean": (w["mean"] * w["count"] + r["mean"] * r["count"]) / total_count,
+                "median": (w["median"] * w["count"] + r["median"] * r["count"]) / total_count,
+                "p95": (w["p95"] * w["count"] + r["p95"] * r["count"]) / total_count,
+                "p99": (w["p99"] * w["count"] + r["p99"] * r["count"]) / total_count,
+                "p999": (w["p999"] * w["count"] + r["p999"] * r["count"]) / total_count,
+                "max": max(w["max"], r["max"]),
+            }
         else:
-            combined_mean = combined_median = combined_p95 = combined_p99 = combined_p999 = combined_max = 0.0
+            combined = {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "p999": 0.0, "max": 0.0}
 
         # Print in cassandra-stress format
-        print(
-            f"Op rate                   : {total_rate:,.0f} op/s  [READ: {read_rate:,.0f} op/s, WRITE: {write_rate:,.0f} op/s]"
-        )
-        print(
-            f"Latency mean              :  {combined_mean:.1f} ms [READ: {read_mean:.1f} ms, WRITE: {write_mean:.1f} ms]"
-        )
-        print(
-            f"Latency median            :  {combined_median:.1f} ms [READ: {read_median:.1f} ms, WRITE: {write_median:.1f} ms]"
-        )
-        print(
-            f"Latency 95th percentile   :  {combined_p95:.1f} ms [READ: {read_p95:.1f} ms, WRITE: {write_p95:.1f} ms]"
-        )
-        print(
-            f"Latency 99th percentile   :  {combined_p99:.1f} ms [READ: {read_p99:.1f} ms, WRITE: {write_p99:.1f} ms]"
-        )
-        print(
-            f"Latency 99.9th percentile :  {combined_p999:.1f} ms [READ: {read_p999:.1f} ms, WRITE: {write_p999:.1f} ms]"
-        )
-        print(
-            f"Latency max               :  {combined_max:,.1f} ms [READ: {read_max:,.1f} ms, WRITE: {write_max:,.1f} ms]"
-        )
+        print(f"""\
+Op rate                   : {total_rate:,.0f} op/s  [READ: {read_rate:,.0f} op/s, WRITE: {write_rate:,.0f} op/s]
+Latency mean              :  {combined["mean"]:.1f} ms [READ: {r["mean"]:.1f} ms, WRITE: {w["mean"]:.1f} ms]
+Latency median            :  {combined["median"]:.1f} ms [READ: {r["median"]:.1f} ms, WRITE: {w["median"]:.1f} ms]
+Latency 95th percentile   :  {combined["p95"]:.1f} ms [READ: {r["p95"]:.1f} ms, WRITE: {w["p95"]:.1f} ms]
+Latency 99th percentile   :  {combined["p99"]:.1f} ms [READ: {r["p99"]:.1f} ms, WRITE: {w["p99"]:.1f} ms]
+Latency 99.9th percentile :  {combined["p999"]:.1f} ms [READ: {r["p999"]:.1f} ms, WRITE: {w["p999"]:.1f} ms]
+Latency max               :  {combined["max"]:,.1f} ms [READ: {r["max"]:,.1f} ms, WRITE: {w["max"]:,.1f} ms]""")
 
     def print_summary(self, duration, ops):
         # Format duration as HH:MM:SS
@@ -1282,7 +1250,9 @@ class CassandraStressPy:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s  [%(name)s] %(asctime)s %(filename)s:%(lineno)s - %(message)s"
+    )
 
     if len(sys.argv) < 2:
         print(__doc__)
@@ -1291,3 +1261,5 @@ if __name__ == "__main__":
     config = parse_cli_args(sys.argv[1:])
     tool = CassandraStressPy(config)
     tool.run()
+
+    print("\nEND")
