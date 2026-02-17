@@ -19,6 +19,14 @@
 - **Details**:
   - Parse `user` and `password` for authentication.
   - Use `PlainTextAuthProvider` when credentials are provided.
+  - Parse `requestTimeout=<ms>` for request timeout configuration.
+    - Value specified in milliseconds (converted to seconds internally for Python driver).
+    - Default: 12000ms (12 seconds) - matches cassandra-stress default.
+    - Case-insensitive parsing (e.g., `requestTimeout`, `REQUESTTIMEOUT`, `RequestTimeout`).
+  - Examples:
+    - `-mode user=cassandra password=secret`
+    - `-mode requestTimeout=30000`
+    - `-mode user=cassandra password=secret requestTimeout=60000`
 
 ### 3. Add Support for `-col` CLI Option
 - **Objective**: Implement column configuration options such as `size=FIXED(1024)` and `n=FIXED(1)`.
@@ -224,6 +232,7 @@
     - `_parse_log_args()` - handles `-log` flag
     - `_parse_mode_arg()` - handles `-mode` flag options
   - **Multiprocess Execution** (always used):
+    - `create_cluster_connection()` - helper function to create Cluster with common config (auth, timeout, policies)
     - `ThreadConnection` - per-thread connection state (Cluster, Session, prepared statements)
     - `WorkerContext` - class holding worker state with thread-local connections
     - `worker_process()` - standalone function spawned as subprocess
@@ -311,7 +320,7 @@
 | `duration=<time>` | Test duration (e.g., `30s`, `5m`, `1h`) | `duration=5m` |
 | `cl=<level>` | Consistency level | `cl=QUORUM` |
 | `-node <hosts>` | Comma-separated list of nodes | `-node 10.0.0.1,10.0.0.2` |
-| `-mode` | Connection mode options | `-mode user=cassandra password=secret` |
+| `-mode` | Connection mode options (user, password, requestTimeout) | `-mode user=cassandra password=secret requestTimeout=30000` |
 | `-rate` | Rate limiting options | `-rate threads=10 processes=4 throttle=1000/s` |
 | `-col` | Column configuration | `-col 'size=FIXED(1024) n=FIXED(5)'` |
 | `-log` | Logging options | `-log hdrfile=output.hdr interval=30s` |
