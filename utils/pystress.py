@@ -146,6 +146,7 @@ class StressConfig:
         self.log_interval = 10  # Default interval for periodic stats (seconds)
         self.ratio_write = 1  # Write ratio for mixed workload
         self.ratio_read = 1  # Read ratio for mixed workload
+        self.request_timeout = None  # Request timeout in seconds (None = use default 12s like cassandra-stress)
 
     @property
     def threads_per_worker(self):
@@ -558,10 +559,15 @@ def parse_cli_args(args):
 
 
 def _parse_mode_arg(config, mode_arg):
-    if "user=" in mode_arg:
+    mode_arg_lower = mode_arg.lower()
+    if mode_arg_lower.startswith("user="):
         config.user = mode_arg.split("=", 1)[1]
-    elif "password=" in mode_arg:
+    elif mode_arg_lower.startswith("password="):
         config.password = mode_arg.split("=", 1)[1]
+    elif mode_arg_lower.startswith("requesttimeout="):
+        # cassandra-stress uses milliseconds, Python driver uses seconds
+        timeout_ms = int(mode_arg.split("=", 1)[1])
+        config.request_timeout = timeout_ms / 1000.0
 
 
 def print_help():
@@ -629,7 +635,9 @@ FLAGS:
     -mode <options>         Connection mode options
                             user=<username>     Authentication username
                             password=<password> Authentication password
+                            requestTimeout=<ms> Request timeout in milliseconds (default: 12000)
                             Example: -mode user=cassandra password=cassandra
+                            Example: -mode requestTimeout=30000
     -h, --help              Show this help message
 
 EXAMPLES:
@@ -655,6 +663,45 @@ NOTES:
     print(help_text)
 
 
+def create_cluster_connection(
+    nodes: list,
+    user: str | None = None,
+    password: str | None = None,
+    consistency_level=ConsistencyLevel.ONE,
+    request_timeout: float | None = None,
+) -> Cluster:
+    """Create a Cluster instance with common configuration.
+
+    Args:
+        nodes: List of contact point IP addresses
+        user: Authentication username (optional)
+        password: Authentication password (optional)
+        consistency_level: CQL consistency level
+        request_timeout: Request timeout in seconds (default: 12s like cassandra-stress)
+
+    Returns:
+        Configured Cluster instance (not connected)
+    """
+    auth_provider = None
+    if user and password:
+        auth_provider = PlainTextAuthProvider(username=user, password=password)
+
+    profile = ExecutionProfile(
+        load_balancing_policy=TokenAwarePolicy(DCAwareRoundRobinPolicy()),
+        consistency_level=consistency_level,
+        request_timeout=request_timeout or 12.0,  # Default 12s like cassandra-stress
+    )
+
+    return Cluster(
+        contact_points=nodes,
+        execution_profiles={EXEC_PROFILE_DEFAULT: profile},
+        protocol_version=4,
+        auth_provider=auth_provider,
+        connect_timeout=11,  # Timeout for initial cluster connection
+        control_connection_timeout=6,  # Timeout for heartbeat responses
+    )
+
+
 class ThreadConnection:
     """Per-thread connection state for ScyllaDB.
 
@@ -673,25 +720,15 @@ class ThreadConnection:
 
     def connect(self):
         """Establish connection and prepare statements."""
-        auth_provider = None
-        if self.config_dict.get("user") and self.config_dict.get("password"):
-            auth_provider = PlainTextAuthProvider(
-                username=self.config_dict["user"],
-                password=self.config_dict["password"],
-            )
-
-        profile = ExecutionProfile(
-            load_balancing_policy=TokenAwarePolicy(DCAwareRoundRobinPolicy()),
+        self.cluster = create_cluster_connection(
+            nodes=self.config_dict["nodes"],
+            user=self.config_dict.get("user"),
+            password=self.config_dict.get("password"),
             consistency_level=getattr(ConsistencyLevel, self.config_dict["consistency_level"]),
-        )
-
-        self.cluster = Cluster(
-            contact_points=self.config_dict["nodes"],
-            execution_profiles={EXEC_PROFILE_DEFAULT: profile},
-            protocol_version=4,
-            auth_provider=auth_provider,
+            request_timeout=self.config_dict.get("request_timeout"),
         )
         self.session = self.cluster.connect()
+        self.session.use_client_timestamp = False
         self.session.set_keyspace(self.config_dict["keyspace_name"])
 
         # Prepare statements
@@ -1258,6 +1295,7 @@ class ProcessPoolManager:
             "output_file": self.config.output_file,
             "num_workers": self.config.processes,
             "threads_per_worker": self.config.threads_per_worker,
+            "request_timeout": self.config.request_timeout,
         }
 
     def start_workers(self):
@@ -1381,22 +1419,15 @@ class CassandraStressPy:
         """
         logger.info(f"Connecting to {self.config.nodes} for schema setup...")
 
-        auth_provider = None
-        if self.config.user and self.config.password:
-            auth_provider = PlainTextAuthProvider(username=self.config.user, password=self.config.password)
-
-        profile = ExecutionProfile(
-            load_balancing_policy=TokenAwarePolicy(DCAwareRoundRobinPolicy()),
+        cluster = create_cluster_connection(
+            nodes=self.config.nodes,
+            user=self.config.user,
+            password=self.config.password,
             consistency_level=self.config.consistency_level,
-        )
-
-        cluster = Cluster(
-            contact_points=self.config.nodes,
-            execution_profiles={EXEC_PROFILE_DEFAULT: profile},
-            protocol_version=4,
-            auth_provider=auth_provider,
+            request_timeout=self.config.request_timeout,
         )
         session = cluster.connect()
+        session.use_client_timestamp = False
 
         try:
             if self.config.replication_strategy == "NetworkTopologyStrategy":
