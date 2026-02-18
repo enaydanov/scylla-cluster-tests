@@ -58,6 +58,13 @@
 - **Details**:
   - Parse and apply column size and count settings.
   - Support both fixed and uniform distributions.
+  - **Column value generation** (cassandra-stress compatible):
+    - Pre-generate 1MB random buffer using `os.urandom()` at worker startup
+    - Each column value is a slice of the random buffer based on key and column index
+    - Different data per column: `offset = ((key * 31) + col_index * 17) % buffer_size`
+    - Different data per row: different keys produce different offsets
+    - Deterministic: same key+column always produces same data (enables read verification)
+    - Random bytes provide realistic compression characteristics
 
 ### 5. Add Support for `duration=` CLI Option
 - **Objective**: Allow users to specify test duration.
