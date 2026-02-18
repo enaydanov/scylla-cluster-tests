@@ -23,18 +23,43 @@
     - Value specified in milliseconds (converted to seconds internally for Python driver).
     - Default: 12000ms (12 seconds) - matches cassandra-stress default.
     - Case-insensitive parsing (e.g., `requestTimeout`, `REQUESTTIMEOUT`, `RequestTimeout`).
+  - Parse `connectTimeout=<ms>` for initial cluster connection timeout.
+    - Value specified in milliseconds (converted to seconds internally for Python driver).
+    - Only passed to driver if explicitly specified (uses driver default otherwise).
+    - Case-insensitive parsing.
+  - Parse `controlConnectionTimeout=<ms>` for control connection timeout.
+    - Value specified in milliseconds (converted to seconds internally for Python driver).
+    - Only passed to driver if explicitly specified (uses driver default otherwise).
+    - Case-insensitive parsing.
+  - Parse `protocolVersion=<version>` for CQL protocol version.
+    - Integer value (e.g., 3, 4, 5).
+    - Only passed to driver if explicitly specified (uses driver default otherwise).
+    - Case-insensitive parsing.
   - Examples:
     - `-mode user=cassandra password=secret`
     - `-mode requestTimeout=30000`
     - `-mode user=cassandra password=secret requestTimeout=60000`
+    - `-mode connectTimeout=15000 controlConnectionTimeout=10000`
+    - `-mode protocolVersion=4`
 
-### 3. Add Support for `-col` CLI Option
+### 3. Add Support for `-port` CLI Option
+- **Objective**: Implement the `-port` option to configure the native CQL port.
+- **Details**:
+  - Parse `native=<port>` for native CQL port configuration.
+    - Integer value (e.g., 9042, 9043).
+    - Only passed to driver if explicitly specified (uses driver default 9042 otherwise).
+    - Case-insensitive parsing.
+  - Examples:
+    - `-port native=9043`
+    - `-port native=19042`
+
+### 4. Add Support for `-col` CLI Option
 - **Objective**: Implement column configuration options such as `size=FIXED(1024)` and `n=FIXED(1)`.
 - **Details**:
   - Parse and apply column size and count settings.
   - Support both fixed and uniform distributions.
 
-### 4. Add Support for `duration=` CLI Option
+### 5. Add Support for `duration=` CLI Option
 - **Objective**: Allow users to specify test duration.
 - **Details**:
   - Use `time.perf_counter()` for accurate time measurement.
@@ -48,14 +73,14 @@
     - `executor.shutdown(wait=False, cancel_futures=True)` cancels pending tasks
   - **Timing accuracy**: Total operation time should be within ~1s of requested duration.
 
-### 5. Add Support for `-rate` CLI Option
+### 6. Add Support for `-rate` CLI Option
 - **Objective**: Implement rate limiting and concurrency control.
 - **Details**:
   - `threads=N`: Number of concurrent threads per worker process.
   - `processes=N`: Number of worker processes (replaces old `connectionsPerHost`).
   - `throttle=N/s`: Support `N/s` syntax for throttling (e.g., `throttle=1000/s`).
 
-### 6. Add Support for `-log` CLI Option
+### 7. Add Support for `-log` CLI Option
 - **Objective**: Enable users to specify HDR Histogram output files and interval statistics.
 - **Details**:
   - Parse `hdrfile=<path>` to specify HDR histogram output file.
@@ -64,13 +89,13 @@
     - Examples: `interval=10`, `interval=10s`, `interval=500ms`.
   - Ensure proper file handling and error reporting.
 
-### 7. Add Help for CLI Options
+### 8. Add Help for CLI Options
 - **Objective**: Provide detailed usage instructions.
 - **Details**:
   - Implement a `--help` flag.
   - Document all supported options and their usage.
 
-### 8. Cassandra-Stress Compatible Output Format
+### 9. Cassandra-Stress Compatible Output Format
 - **Objective**: Match cassandra-stress output format for easy integration with existing tooling.
 - **Details**:
   - **Summary output for single operation type** (write or read):
@@ -109,7 +134,7 @@
   - Latencies displayed in milliseconds for consistency with cassandra-stress.
   - Duration formatted as `HH:MM:SS`.
 
-### 9. Add Support for `-schema` Option (cassandra-stress format)
+### 10. Add Support for `-schema` Option (cassandra-stress format)
 - **Objective**: Support the full cassandra-stress `-schema` option format.
 - **Details**:
   - Parse nested function-style options matching cassandra-stress format:
@@ -125,7 +150,7 @@
     - `-schema 'replication(replication_factor=3) compaction(strategy=SizeTieredCompactionStrategy)'`
     - `-schema 'keyspace=mystress compaction(strategy=LeveledCompactionStrategy) compression=LZ4Compressor'`
 
-### 10. Add Support for `-pop dist=` Option (Population Distributions)
+### 11. Add Support for `-pop dist=` Option (Population Distributions)
 - **Objective**: Support cassandra-stress style population distribution options.
 - **Details**:
   - Supported distribution formats:
@@ -144,7 +169,7 @@
     - `-pop 'dist=GAUSSIAN(1..1000000,5)'` (stdvrng=5)
     - `-pop 'dist=gauss(1..1000000,500000,100000)'` (explicit mean=500000, stdev=100000)
 
-### 11. Cassandra-Stress Compatible HDR File Format
+### 12. Cassandra-Stress Compatible HDR File Format
 - **Objective**: Generate HDR histogram files matching cassandra-stress format.
 - **Details**:
   - Custom `TaggedHistogramLogWriter` class extends `HistogramLogWriter` to support tag output
@@ -173,7 +198,7 @@
   - Note: `mixed` command outputs both `WRITE-st` and `READ-st` histograms
   - Note: Format version 1.2 is a Python hdrhistogram library limitation (cassandra-stress uses 1.3)
 
-### 12. Separate Read/Write Histograms with Interval-Based HDR Output
+### 13. Separate Read/Write Histograms with Interval-Based HDR Output
 - **Objective**: Maintain separate histograms for READ and WRITE operations, output to HDR file periodically.
 - **Details**:
   - Separate histogram tracking:
@@ -194,7 +219,7 @@
     - Prints separate statistics for READ and WRITE operations
     - Uses accumulated summary histograms
 
-### 13. Add Support for `ratio(write=N,read=M)` Option
+### 14. Add Support for `ratio(write=N,read=M)` Option
 - **Objective**: Allow configuring the read/write ratio for mixed workloads.
 - **Details**:
   - Parse `ratio(write=N,read=M)` syntax after `mixed` command
@@ -207,7 +232,7 @@
     - `mixed 'ratio(write=1,read=2)'` - 33% writes, 67% reads
     - `mixed 'ratio(read=3,write=1)'` - 25% writes, 75% reads
 
-### 14. Nanosecond Latency Storage (cassandra-stress compatibility)
+### 15. Nanosecond Latency Storage (cassandra-stress compatibility)
 - **Objective**: Store latency values in nanoseconds to match cassandra-stress implementation.
 - **Details**:
   - Latency values captured using `time.perf_counter()` and converted to nanoseconds
@@ -220,7 +245,7 @@
     - Higher precision for sub-microsecond latencies
     - Easier comparison when analyzing HDR files from both tools
 
-### 15. Code Architecture and Maintainability
+### 16. Code Architecture and Maintainability
 - **Objective**: Keep code maintainable and compliant with linting rules.
 - **Details**:
   - **CLI Parsing** - Modular helper functions for each flag type:
@@ -320,7 +345,8 @@
 | `duration=<time>` | Test duration (e.g., `30s`, `5m`, `1h`) | `duration=5m` |
 | `cl=<level>` | Consistency level | `cl=QUORUM` |
 | `-node <hosts>` | Comma-separated list of nodes | `-node 10.0.0.1,10.0.0.2` |
-| `-mode` | Connection mode options (user, password, requestTimeout) | `-mode user=cassandra password=secret requestTimeout=30000` |
+| `-port` | Port configuration (native=port) | `-port native=9043` |
+| `-mode` | Connection mode options (user, password, requestTimeout, connectTimeout, controlConnectionTimeout, protocolVersion) | `-mode user=cassandra password=secret requestTimeout=30000` |
 | `-rate` | Rate limiting options | `-rate threads=10 processes=4 throttle=1000/s` |
 | `-col` | Column configuration | `-col 'size=FIXED(1024) n=FIXED(5)'` |
 | `-log` | Logging options | `-log hdrfile=output.hdr interval=30s` |

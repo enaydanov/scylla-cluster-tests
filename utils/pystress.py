@@ -127,6 +127,7 @@ class StressConfig:
         self.col_count = 1
         # Distributions
         self.nodes = ["127.0.0.1"]
+        self.port = None  # Native CQL port (None = driver default 9042)
         self.replication_factor = 1
         self.replication_strategy = "SimpleStrategy"
         self.keyspace_name = "keyspace1"
@@ -147,6 +148,9 @@ class StressConfig:
         self.ratio_write = 1  # Write ratio for mixed workload
         self.ratio_read = 1  # Read ratio for mixed workload
         self.request_timeout = None  # Request timeout in seconds (None = use default 12s like cassandra-stress)
+        self.connect_timeout = None  # Connect timeout in seconds (None = driver default)
+        self.control_connection_timeout = None  # Control connection timeout in seconds (None = driver default)
+        self.protocol_version = None  # CQL protocol version (None = driver default)
 
     @property
     def threads_per_worker(self):
@@ -551,6 +555,11 @@ def parse_cli_args(args):
             while i < len(args) and not args[i].startswith("-"):
                 _parse_mode_arg(config, args[i])
                 i += 1
+        elif arg == "-port":
+            i += 1
+            while i < len(args) and not args[i].startswith("-"):
+                _parse_port_arg(config, args[i])
+                i += 1
         else:
             # Skip unknown
             i += 1
@@ -568,6 +577,23 @@ def _parse_mode_arg(config, mode_arg):
         # cassandra-stress uses milliseconds, Python driver uses seconds
         timeout_ms = int(mode_arg.split("=", 1)[1])
         config.request_timeout = timeout_ms / 1000.0
+    elif mode_arg_lower.startswith("connecttimeout="):
+        # cassandra-stress uses milliseconds, Python driver uses seconds
+        timeout_ms = int(mode_arg.split("=", 1)[1])
+        config.connect_timeout = timeout_ms / 1000.0
+    elif mode_arg_lower.startswith("controlconnectiontimeout="):
+        # cassandra-stress uses milliseconds, Python driver uses seconds
+        timeout_ms = int(mode_arg.split("=", 1)[1])
+        config.control_connection_timeout = timeout_ms / 1000.0
+    elif mode_arg_lower.startswith("protocolversion="):
+        config.protocol_version = int(mode_arg.split("=", 1)[1])
+
+
+def _parse_port_arg(config, port_arg):
+    """Parse a single -port argument like native=9042."""
+    port_arg_lower = port_arg.lower()
+    if port_arg_lower.startswith("native="):
+        config.port = int(port_arg.split("=", 1)[1])
 
 
 def print_help():
@@ -636,8 +662,16 @@ FLAGS:
                             user=<username>     Authentication username
                             password=<password> Authentication password
                             requestTimeout=<ms> Request timeout in milliseconds (default: 12000)
+                            connectTimeout=<ms> Connect timeout in milliseconds
+                            controlConnectionTimeout=<ms> Control connection timeout in milliseconds
+                            protocolVersion=<version> CQL protocol version (e.g., 3, 4, 5)
                             Example: -mode user=cassandra password=cassandra
                             Example: -mode requestTimeout=30000
+                            Example: -mode connectTimeout=15000 controlConnectionTimeout=10000
+                            Example: -mode protocolVersion=4
+    -port <options>         Port configuration
+                            native=<port>       Native CQL port (default: 9042)
+                            Example: -port native=9043
     -h, --help              Show this help message
 
 EXAMPLES:
@@ -669,6 +703,10 @@ def create_cluster_connection(
     password: str | None = None,
     consistency_level=ConsistencyLevel.ONE,
     request_timeout: float | None = None,
+    connect_timeout: float | None = None,
+    control_connection_timeout: float | None = None,
+    protocol_version: int | None = None,
+    port: int | None = None,
 ) -> Cluster:
     """Create a Cluster instance with common configuration.
 
@@ -678,6 +716,10 @@ def create_cluster_connection(
         password: Authentication password (optional)
         consistency_level: CQL consistency level
         request_timeout: Request timeout in seconds (default: 12s like cassandra-stress)
+        connect_timeout: Connect timeout in seconds (optional, uses driver default if not set)
+        control_connection_timeout: Control connection timeout in seconds (optional, uses driver default if not set)
+        protocol_version: CQL protocol version (optional, uses driver default if not set)
+        port: Native CQL port (optional, uses driver default 9042 if not set)
 
     Returns:
         Configured Cluster instance (not connected)
@@ -692,14 +734,21 @@ def create_cluster_connection(
         request_timeout=request_timeout or 12.0,  # Default 12s like cassandra-stress
     )
 
-    return Cluster(
-        contact_points=nodes,
-        execution_profiles={EXEC_PROFILE_DEFAULT: profile},
-        protocol_version=4,
-        auth_provider=auth_provider,
-        connect_timeout=11,  # Timeout for initial cluster connection
-        control_connection_timeout=6,  # Timeout for heartbeat responses
-    )
+    cluster_kwargs = {
+        "contact_points": nodes,
+        "execution_profiles": {EXEC_PROFILE_DEFAULT: profile},
+        "auth_provider": auth_provider,
+    }
+    if connect_timeout is not None:
+        cluster_kwargs["connect_timeout"] = connect_timeout
+    if control_connection_timeout is not None:
+        cluster_kwargs["control_connection_timeout"] = control_connection_timeout
+    if protocol_version is not None:
+        cluster_kwargs["protocol_version"] = protocol_version
+    if port is not None:
+        cluster_kwargs["port"] = port
+
+    return Cluster(**cluster_kwargs)
 
 
 class ThreadConnection:
@@ -726,6 +775,10 @@ class ThreadConnection:
             password=self.config_dict.get("password"),
             consistency_level=getattr(ConsistencyLevel, self.config_dict["consistency_level"]),
             request_timeout=self.config_dict.get("request_timeout"),
+            connect_timeout=self.config_dict.get("connect_timeout"),
+            control_connection_timeout=self.config_dict.get("control_connection_timeout"),
+            protocol_version=self.config_dict.get("protocol_version"),
+            port=self.config_dict.get("port"),
         )
         self.session = self.cluster.connect()
         self.session.use_client_timestamp = False
@@ -1285,6 +1338,7 @@ class ProcessPoolManager:
         """Convert config to a picklable dict."""
         return {
             "nodes": self.config.nodes,
+            "port": self.config.port,
             "user": self.config.user,
             "password": self.config.password,
             "consistency_level": consistency_value_to_name(self.config.consistency_level),
@@ -1296,6 +1350,9 @@ class ProcessPoolManager:
             "num_workers": self.config.processes,
             "threads_per_worker": self.config.threads_per_worker,
             "request_timeout": self.config.request_timeout,
+            "connect_timeout": self.config.connect_timeout,
+            "control_connection_timeout": self.config.control_connection_timeout,
+            "protocol_version": self.config.protocol_version,
         }
 
     def start_workers(self):
@@ -1425,6 +1482,10 @@ class CassandraStressPy:
             password=self.config.password,
             consistency_level=self.config.consistency_level,
             request_timeout=self.config.request_timeout,
+            connect_timeout=self.config.connect_timeout,
+            control_connection_timeout=self.config.control_connection_timeout,
+            protocol_version=self.config.protocol_version,
+            port=self.config.port,
         )
         session = cluster.connect()
         session.use_client_timestamp = False
