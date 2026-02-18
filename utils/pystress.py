@@ -35,6 +35,7 @@ import re
 import multiprocessing
 import multiprocessing.synchronize
 import queue
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 from datetime import datetime
@@ -50,6 +51,9 @@ from hdrh.log import HistogramLogWriter
 logger = logging.getLogger(__name__)
 
 TABLE_NAME = "standard1"
+
+# Random data buffer size for column values (1MB)
+RANDOM_BUFFER_SIZE = 1024 * 1024
 
 
 class TaggedHistogramLogWriter(HistogramLogWriter):
@@ -758,14 +762,24 @@ class ThreadConnection:
     to avoid contention and provide true connection isolation.
     """
 
-    def __init__(self, config_dict: dict, col_count: int, payload_cache: bytes):
+    def __init__(self, config_dict: dict, col_count: int, col_size: int, random_buffer: bytes):
         self.config_dict = config_dict
         self.col_count = col_count
-        self.payload_cache = payload_cache
+        self.col_size = col_size
+        self.random_buffer = random_buffer
         self.cluster = None
         self.session = None
         self.prepared_write = None
         self.prepared_read = None
+
+    def get_column_value(self, key_int: int, col_index: int) -> bytes:
+        """Get deterministic random bytes for a column based on key and column index.
+
+        Uses a pre-generated random buffer and computes offset based on key and column
+        to provide different data per row and per column, matching cassandra-stress behavior.
+        """
+        offset = ((key_int * 31) + col_index * 17) % (len(self.random_buffer) - self.col_size)
+        return self.random_buffer[offset : offset + self.col_size]
 
     def connect(self):
         """Establish connection and prepare statements."""
@@ -813,10 +827,11 @@ class WorkerContext:
         self.worker_id = worker_id
         self.config_dict = config_dict
         self.col_count = config_dict["col_count"]
+        self.col_size = config_dict["col_size"]
         self.threads_per_worker = config_dict["threads_per_worker"]
 
-        # Shared payload cache (read-only, generated once)
-        self.payload_cache = b"x" * config_dict["col_size"]
+        # Pre-generate random buffer for column values (like cassandra-stress)
+        self.random_buffer = os.urandom(RANDOM_BUFFER_SIZE)
 
         # Pre-allocated connections (one per thread, indexed by thread number)
         self._connections: list[ThreadConnection] = []
@@ -845,7 +860,7 @@ class WorkerContext:
         """Pre-create connections for all threads before workload starts."""
         self.logger.debug(f"Creating {self.threads_per_worker} connections...")
         for i in range(self.threads_per_worker):
-            conn = ThreadConnection(self.config_dict, self.col_count, self.payload_cache)
+            conn = ThreadConnection(self.config_dict, self.col_count, self.col_size, self.random_buffer)
             conn.connect()
             self._connections.append(conn)
         self.logger.debug(f"Created {self.threads_per_worker} connections")
@@ -867,7 +882,10 @@ class WorkerContext:
 
     def _do_write(self, conn: ThreadConnection, key_int: int) -> int:
         """Execute write using given connection."""
-        args = [self._generate_key(key_int)] + [conn.payload_cache] * conn.col_count
+        key = self._generate_key(key_int)
+        # Generate different random data for each column (like cassandra-stress)
+        col_values = [conn.get_column_value(key_int, i) for i in range(conn.col_count)]
+        args = [key] + col_values
         t0 = time.perf_counter()
         conn.session.execute(conn.prepared_write, args)
         return int((time.perf_counter() - t0) * 1_000_000_000)
