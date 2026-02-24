@@ -388,6 +388,59 @@ def parse_ratio_option(ratio_str):
     return result
 
 
+def parse_cl_ratio_option(ratio_str: str) -> dict:
+    """
+    Parse consistency level ratio option for weighted random CL selection.
+
+    Format: ratio(ONE=1,QUORUM=2,LOCAL_QUORUM=3)
+
+    Each connection will be created with a randomly selected CL based on weights.
+    Example: ratio(ONE=1,QUORUM=2) means 33% ONE, 67% QUORUM
+
+    Returns:
+        dict mapping ConsistencyLevel enum to weight
+
+    Raises:
+        ValueError: If format is invalid or CL name is unknown
+    """
+    result = {}
+    ratio_match = re.search(r"ratio\s*\(([^)]+)\)", ratio_str, re.IGNORECASE)
+    if ratio_match:
+        content = ratio_match.group(1)
+        # Match patterns like ONE=1, QUORUM=2, LOCAL_QUORUM=3
+        for match in re.finditer(r"(\w+)\s*=\s*(\d+)", content):
+            cl_name = match.group(1).upper()
+            weight = int(match.group(2))
+            try:
+                cl = getattr(ConsistencyLevel, cl_name)
+                result[cl] = weight
+            except AttributeError:
+                raise ValueError(f"Unknown consistency level: {cl_name}")
+    if not result:
+        raise ValueError(f"Invalid cl ratio format: {ratio_str}")
+    return result
+
+
+def select_random_cl(cl_config) -> ConsistencyLevel:
+    """
+    Select a consistency level from config.
+
+    If cl_config is a single ConsistencyLevel, return it.
+    If cl_config is a dict of {CL: weight}, randomly select based on weights.
+
+    Args:
+        cl_config: Either a ConsistencyLevel enum or dict[ConsistencyLevel, int]
+
+    Returns:
+        Selected ConsistencyLevel
+    """
+    if isinstance(cl_config, dict):
+        cls = list(cl_config.keys())
+        weights = list(cl_config.values())
+        return random.choices(cls, weights=weights, k=1)[0]
+    return cl_config
+
+
 def _parse_key_value_arg(config, key, val):
     """Parse a key=value argument and update config."""
     if key == "n":
@@ -395,9 +448,18 @@ def _parse_key_value_arg(config, key, val):
     elif key == "duration":
         config.duration = parse_duration(val)
     elif key == "cl":
-        try:
-            config.consistency_level = getattr(ConsistencyLevel, val.upper())
-        except AttributeError:
+        # Check if it's a ratio format: cl=ratio(ONE=1,QUORUM=2,...)
+        if val.lower().startswith("ratio("):
+            try:
+                config.consistency_level = parse_cl_ratio_option(val)
+            except ValueError as e:
+                logger.error(f"Invalid cl ratio: {e}")
+                sys.exit(1)
+        else:
+            try:
+                config.consistency_level = getattr(ConsistencyLevel, val.upper())
+            except AttributeError:
+                logger.warning(f"Unknown CL {val}, defaulting to ONE")
             logger.warning(f"Unknown CL {val}, defaulting to ONE")
 
 
@@ -623,6 +685,10 @@ POSITIONAL ARGUMENTS (key=value):
                             Example: duration=5m
     cl=<consistency>        Consistency level (default: ONE)
                             Options: ONE, QUORUM, LOCAL_QUORUM, etc.
+                            Weighted ratio format: cl=ratio(ONE=1,QUORUM=2,LOCAL_QUORUM=3)
+                              Creates connections with random CL based on weights
+                              Example: ratio(ONE=1,QUORUM=2) = 33% ONE, 67% QUORUM
+                            Note: Schema setup always uses LOCAL_QUORUM regardless of this setting
 
 FLAGS:
     -rate <options>         Rate and parallelism options
@@ -783,11 +849,22 @@ class ThreadConnection:
 
     def connect(self):
         """Establish connection and prepare statements."""
+        # Determine consistency level for this connection
+        if "cl_ratio" in self.config_dict:
+            # Reconstruct CL ratio dict and select random CL based on weights
+            cl_ratio = {
+                getattr(ConsistencyLevel, name): weight for name, weight in self.config_dict["cl_ratio"].items()
+            }
+            selected_cl = select_random_cl(cl_ratio)
+            logger.debug(f"Connection using CL={consistency_value_to_name(selected_cl)} (from ratio)")
+        else:
+            selected_cl = getattr(ConsistencyLevel, self.config_dict["consistency_level"])
+
         self.cluster = create_cluster_connection(
             nodes=self.config_dict["nodes"],
             user=self.config_dict.get("user"),
             password=self.config_dict.get("password"),
-            consistency_level=getattr(ConsistencyLevel, self.config_dict["consistency_level"]),
+            consistency_level=selected_cl,
             request_timeout=self.config_dict.get("request_timeout"),
             connect_timeout=self.config_dict.get("connect_timeout"),
             control_connection_timeout=self.config_dict.get("control_connection_timeout"),
@@ -1354,12 +1431,24 @@ class ProcessPoolManager:
 
     def _config_to_dict(self):
         """Convert config to a picklable dict."""
+        # Serialize consistency_level appropriately for IPC
+        if isinstance(self.config.consistency_level, dict):
+            # Weighted ratio: {CL: weight} -> {"cl_ratio": {"ONE": 1, "QUORUM": 2}}
+            cl_config = {
+                "cl_ratio": {
+                    consistency_value_to_name(cl): weight for cl, weight in self.config.consistency_level.items()
+                }
+            }
+        else:
+            # Single CL
+            cl_config = {"consistency_level": consistency_value_to_name(self.config.consistency_level)}
+
         return {
             "nodes": self.config.nodes,
             "port": self.config.port,
             "user": self.config.user,
             "password": self.config.password,
-            "consistency_level": consistency_value_to_name(self.config.consistency_level),
+            **cl_config,
             "keyspace_name": self.config.keyspace_name,
             "col_count": self.config.col_count,
             "col_size": self.config.col_size,
@@ -1490,15 +1579,19 @@ class CassandraStressPy:
     def setup_schema(self):
         """Connect to cluster, create keyspace and table, then disconnect.
 
+        Schema operations always use LOCAL_QUORUM for consistency,
+        regardless of user-specified CL for workload operations.
         Workers create their own connections for actual workload execution.
         """
         logger.info(f"Connecting to {self.config.nodes} for schema setup...")
 
+        # Schema operations always use LOCAL_QUORUM for strong consistency
+        # This matches cassandra-stress behavior where schema uses QUORUM/LOCAL_QUORUM
         cluster = create_cluster_connection(
             nodes=self.config.nodes,
             user=self.config.user,
             password=self.config.password,
-            consistency_level=self.config.consistency_level,
+            consistency_level=ConsistencyLevel.LOCAL_QUORUM,
             request_timeout=self.config.request_timeout,
             connect_timeout=self.config.connect_timeout,
             control_connection_timeout=self.config.control_connection_timeout,

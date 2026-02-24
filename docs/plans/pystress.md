@@ -339,6 +339,46 @@
     pystress.py write duration=15s -rate threads=40 processes=4
     ```
 
+### 18. Add Support for Weighted Random Consistency Level (`cl=ratio(...)`)
+- **Objective**: Allow configuring weighted random consistency level selection for worker connections.
+- **Details**:
+  - **Format**: `cl=ratio(ONE=1,QUORUM=2,LOCAL_QUORUM=3)`
+  - **Behavior**:
+    - Each worker connection is created with a randomly selected CL based on weights
+    - With `ONE=1,QUORUM=2,LOCAL_QUORUM=3` (total weight=6):
+      - 1/6 chance (~17%) of ONE
+      - 2/6 chance (~33%) of QUORUM
+      - 3/6 chance (~50%) of LOCAL_QUORUM
+    - CL selection happens once per connection at creation time
+    - All operations on that connection use the selected CL
+  - **Schema operations always use LOCAL_QUORUM**:
+    - Regardless of user-specified CL ratio, schema setup uses LOCAL_QUORUM
+    - This matches cassandra-stress behavior where schema operations need strong consistency
+  - **Backward compatibility**: Single CL format (`cl=QUORUM`) continues to work
+  - **Parsing**: Case-insensitive CL names, spaces allowed around `=`
+  - **Validation**: Invalid CL names raise an error with helpful message
+  - **Implementation**:
+    - `parse_cl_ratio_option()` - parses ratio string into `dict[ConsistencyLevel, int]`
+    - `select_random_cl()` - selects CL randomly based on weights using `random.choices()`
+    - `StressConfig.consistency_level` - stores either `ConsistencyLevel` or `dict[ConsistencyLevel, int]`
+    - `_config_to_dict()` - serializes as `cl_ratio` dict for IPC when ratio format is used
+    - `ThreadConnection.connect()` - calls `select_random_cl()` when `cl_ratio` is present
+    - `setup_schema()` - hardcoded to use `ConsistencyLevel.LOCAL_QUORUM`
+  - **Examples**:
+    ```bash
+    # Single CL (backward compatible)
+    pystress.py write cl=QUORUM -node 192.168.1.10
+
+    # Weighted random CL: 33% ONE, 67% QUORUM
+    pystress.py write cl=ratio(ONE=1,QUORUM=2) -node 192.168.1.10
+
+    # Multiple CLs with different weights
+    pystress.py write cl=ratio(ONE=1,QUORUM=2,LOCAL_QUORUM=3) -rate threads=50
+
+    # Schema always uses LOCAL_QUORUM regardless of this setting
+    pystress.py write cl=ratio(ONE=10) -node 192.168.1.10
+    ```
+
 ---
 
 ## CLI Options Reference
@@ -350,7 +390,7 @@
 | `mixed` | Mixed read/write workload with optional ratio | `pystress.py mixed 'ratio(write=1,read=2)' n=10000` |
 | `n=<num>` | Number of operations | `n=1000000` |
 | `duration=<time>` | Test duration (e.g., `30s`, `5m`, `1h`) | `duration=5m` |
-| `cl=<level>` | Consistency level | `cl=QUORUM` |
+| `cl=<level>` | Consistency level (single or weighted ratio) | `cl=QUORUM` or `cl=ratio(ONE=1,QUORUM=2)` |
 | `-node <hosts>` | Comma-separated list of nodes | `-node 10.0.0.1,10.0.0.2` |
 | `-port` | Port configuration (native=port) | `-port native=9043` |
 | `-mode` | Connection mode options (user, password, requestTimeout, connectTimeout, controlConnectionTimeout, protocolVersion) | `-mode user=cassandra password=secret requestTimeout=30000` |
@@ -364,4 +404,4 @@
 ---
 
 ## Summary
-The `pystress.py` tool is a versatile and lightweight benchmarking solution for ScyllaDB. By mimicking the `cassandra-stress` CLI interface and output format, it ensures ease of use and compatibility with existing tooling while providing advanced features such as HDR Histogram generation, flexible schema configurations, periodic interval statistics with strict timing, separate read/write histogram tracking, configurable read/write ratios, multiprocess execution for true parallelism, accurate duration enforcement via stop_event signaling, and precise traffic control. This plan outlines the key steps and features implemented to achieve a robust and user-friendly tool.
+The `pystress.py` tool is a versatile and lightweight benchmarking solution for ScyllaDB. By mimicking the `cassandra-stress` CLI interface and output format, it ensures ease of use and compatibility with existing tooling while providing advanced features such as HDR Histogram generation, flexible schema configurations, periodic interval statistics with strict timing, separate read/write histogram tracking, configurable read/write ratios, multiprocess execution for true parallelism, accurate duration enforcement via stop_event signaling, weighted random consistency level selection for testing mixed CL scenarios, and precise traffic control. This plan outlines the key steps and features implemented to achieve a robust and user-friendly tool.
