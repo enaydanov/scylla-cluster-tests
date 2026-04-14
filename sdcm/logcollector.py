@@ -101,6 +101,18 @@ class CollectingNode:
             "Name": self.name,
         }
 
+    def close(self):
+        """Stop the SSH remoter to release file descriptors and connections.
+
+        Only stops RemoteCmdRunnerBase instances (not LocalCmdRunner which has no stop()).
+        Safe to call multiple times.
+        """
+        if self.remoter and isinstance(self.remoter, RemoteCmdRunnerBase):
+            try:
+                self.remoter.stop()
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("Failed to stop remoter for node %s", self.name, exc_info=True)
+
     @cached_property
     def distro(self):
         LOGGER.debug("Trying to detect Linux distribution...")
@@ -1868,6 +1880,25 @@ class Collector:
         else:
             self.create_collecting_nodes()
 
+    def _close_collecting_nodes(self):
+        """Close all SSH connections held by CollectingNode instances to prevent fd exhaustion.
+
+        On large clusters (30+ nodes), each CollectingNode holds an SSH remoter whose
+        thread-local connections accumulate across multiple ParallelObject thread pools.
+        Explicitly closing them after collection prevents file descriptor exhaustion.
+        """
+        all_node_sets = [
+            self.db_cluster, self.monitor_set, self.loader_set,
+            self.kubernetes_set, self.siren_manager_set, self.vector_store_set,
+        ]
+        closed = 0
+        for node_set in all_node_sets:
+            for node in node_set:
+                if isinstance(node, CollectingNode):
+                    node.close()
+                    closed += 1
+        LOGGER.info("Closed SSH connections for %d collecting nodes", closed)
+
     def run(self):
         """Run collect logs process as standalone operation
 
@@ -1894,27 +1925,30 @@ class Collector:
 
         self.create_base_storage_dir(local_dir_with_logs)
         LOGGER.info("Created directory to storing collected logs: %s", self.storage_dir)
-        for cluster_log_collector, nodes in self.cluster_log_collectors.items():
-            log_collector = cluster_log_collector(
-                nodes, test_id=self.test_id, storage_dir=self.storage_dir, params=self.params
-            )
-            LOGGER.info("Start collect logs for cluster %s", log_collector.cluster_log_type)
-            try:
-                if result := log_collector.collect_logs(local_search_path=local_dir_with_logs):
-                    results[log_collector.cluster_log_type] = result
-                    LOGGER.info("collected data for %s\n%s\n", log_collector.cluster_log_type, result)
-                else:
-                    LOGGER.warning("There are no logs collected for %s", log_collector.cluster_log_type)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning(
-                    "%s is not able to collect logs. Moving to the next log collector",
-                    log_collector.__class__.__name__,
-                    exc_info=True,
+        try:
+            for cluster_log_collector, nodes in self.cluster_log_collectors.items():
+                log_collector = cluster_log_collector(
+                    nodes, test_id=self.test_id, storage_dir=self.storage_dir, params=self.params
                 )
-                # Track critical collector failures (SCT runner logs)
-                # Check if collector is BaseSCTLogCollector or any of its subclasses
-                if issubclass(cluster_log_collector, BaseSCTLogCollector):
-                    failed_critical_collectors.append((log_collector.cluster_log_type, str(exc)))
+                LOGGER.info("Start collect logs for cluster %s", log_collector.cluster_log_type)
+                try:
+                    if result := log_collector.collect_logs(local_search_path=local_dir_with_logs):
+                        results[log_collector.cluster_log_type] = result
+                        LOGGER.info("collected data for %s\n%s\n", log_collector.cluster_log_type, result)
+                    else:
+                        LOGGER.warning("There are no logs collected for %s", log_collector.cluster_log_type)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning(
+                        "%s is not able to collect logs. Moving to the next log collector",
+                        log_collector.__class__.__name__,
+                        exc_info=True,
+                    )
+                    # Track critical collector failures (SCT runner logs)
+                    # Check if collector is BaseSCTLogCollector or any of its subclasses
+                    if issubclass(cluster_log_collector, BaseSCTLogCollector):
+                        failed_critical_collectors.append((log_collector.cluster_log_type, str(exc)))
+        finally:
+            self._close_collecting_nodes()
 
         self.localhost.destroy()
 
