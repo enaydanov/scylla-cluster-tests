@@ -904,6 +904,9 @@ class SCTConfiguration(BaseModel):
     nemesis_sequence_sleep_between_ops: MultitenantValue(IntOrList) = SctField(
         description="""Sleep interval between nemesis operations for use in unique_sequence nemesis kind of tests""",
     )
+    nemesis_stop_wait_start_sleep_time: int = SctField(
+        description="""Time in seconds to wait between stop and start of Scylla server in StopWaitStartMonkey nemesis. Default: 600""",
+    )
     nemesis_during_prepare: MultitenantValue(BooleanOrList) = SctField(
         description="""Run nemesis during prepare stage of the test""",
     )

@@ -75,7 +75,8 @@ class StopWaitStartMonkey(NemesisBaseClass):
     zero_node_changes = True
 
     def disrupt(self):
-        self.runner.disrupt_stop_wait_start_scylla_server(600)
+        sleep_time = self.runner.tester.params.get("nemesis_stop_wait_start_sleep_time") or 600
+        self.runner.disrupt_stop_wait_start_scylla_server(sleep_time)
 
 
 @target_all_nodes
