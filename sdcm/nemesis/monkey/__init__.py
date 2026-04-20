@@ -3,6 +3,9 @@ Module containing all disruptions logic/classes
 Classes can be used in nemesis_selector
 """
 
+import random
+import time
+
 from sdcm.nemesis import target_all_nodes, NemesisBaseClass, target_data_nodes
 from sdcm.nemesis.utils import NEMESIS_TARGET_POOLS
 
@@ -77,6 +80,56 @@ class StopWaitStartMonkey(NemesisBaseClass):
     def disrupt(self):
         sleep_time = self.runner.tester.params.get("nemesis_stop_wait_start_sleep_time") or 600
         self.runner.disrupt_stop_wait_start_scylla_server(sleep_time)
+
+
+@target_all_nodes
+class MultipleNodesStopWaitStartMonkey(NemesisBaseClass):
+    """Stops Scylla on multiple nodes simultaneously, waits, then restarts them all.
+
+    Designed to reproduce gossip message storms (e.g. CACHE_HITRATES accumulation)
+    that occur when multiple nodes restart concurrently and flood peers with large
+    gossip SYN/ACK/ACK2 messages. Configurable via:
+      - nemesis_multi_node_restart_count: number of nodes to stop (default 3)
+      - nemesis_stop_wait_start_sleep_time: seconds between stop and start (default 600)
+    """
+
+    disruptive = True
+    kubernetes = True
+    xcloud = True
+    limited = True
+    zero_node_changes = True
+
+    def disrupt(self):
+        node_count = self.runner.tester.params.get("nemesis_multi_node_restart_count") or 3
+        sleep_time = self.runner.tester.params.get("nemesis_stop_wait_start_sleep_time") or 600
+
+        # Select random nodes from the cluster, excluding the already-reserved target node
+        available_nodes = [n for n in self.runner.cluster.nodes
+                          if n != self.runner.target_node and not n.running_nemesis]
+        if len(available_nodes) < node_count - 1:
+            self.runner.log.warning(
+                "Requested %d nodes but only %d available (plus target). Using all available.",
+                node_count, len(available_nodes) + 1)
+            extra_nodes = available_nodes
+        else:
+            extra_nodes = random.sample(available_nodes, node_count - 1)
+
+        # Target node is already reserved by the runner; reserve the extra nodes
+        all_nodes = [self.runner.target_node] + extra_nodes
+        nemesis_name = self.runner.current_disruption
+        with self.runner.node_allocator.nodes_running_nemesis(extra_nodes, nemesis_name):
+            self.runner.log.info("Stopping Scylla on %d nodes: %s",
+                                len(all_nodes), [n.name for n in all_nodes])
+            for node in all_nodes:
+                node.stop_scylla_server(verify_up=False, verify_down=True)
+
+            self.runner.log.info("All %d nodes stopped. Sleeping for %d seconds.", len(all_nodes), sleep_time)
+            time.sleep(sleep_time)
+
+            self.runner.log.info("Starting Scylla on %d nodes: %s",
+                                len(all_nodes), [n.name for n in all_nodes])
+            for node in all_nodes:
+                node.start_scylla_server(verify_up=True, verify_down=False)
 
 
 @target_all_nodes
