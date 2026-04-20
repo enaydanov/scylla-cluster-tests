@@ -1,0 +1,144 @@
+use latte::*;
+
+const TOTAL_ROWS = latte::param!("rows", 100_000_000);
+const RF = latte::param!("replication_factor", 3);
+const TABLETS = latte::param!("tablets", false);
+const TABLE_COUNT = latte::param!("table_count", 2000);
+const ROWS_PER_PARTITION = latte::param!("rows_per_partition", 1000);
+const PARTITION_SIZES = "100:1";
+
+// Keyspace and table names are padded to 192 characters (ScyllaDB's schema::NAME_LENGTH
+// limit) to maximize the CACHE_HITRATES gossip payload size. Each gossip entry is
+// "ks_name.table_name:0.000000;" — longer names mean larger payloads per table,
+// directly increasing memory pressure during gossip storms.
+//
+// With 2000 tables at 192-char names: ~790 KB per CACHE_HITRATES value vs ~220 KB
+// with short names (3.6x multiplier).
+
+// 192-char keyspace: "oom_" (4) + 188 'p' = 192
+const KS = latte::param!("keyspace", "oom_pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp");
+
+// 192-char main table: "tbl_" (4) + 183 'p' + "_main" (5) = 192
+const TABLE = latte::param!("table", "tbl_ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp_main");
+
+// 187-char prefix for loop tables: "tbl_" (4) + 183 'p' = 187
+// Full loop table name: TABLE_PREFIX (187) + "_" (1) + zero-padded index (4) = 192
+const TABLE_PREFIX = "tbl_ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp";
+
+// Zero-pad index i so that table names are always exactly 192 chars.
+// Adapted from data_dir/latte/schema_scale.rn.
+async fn get_index_padding(i, max_len) {
+    let max_digits = max_len.to_string().len();
+    let i_digits = i.to_string().len();
+    let padding = "";
+    let current_i = 0;
+    while max_digits > i_digits + current_i {
+        padding = padding + "0";
+        current_i = current_i + 1;
+    }
+    padding
+}
+
+pub async fn schema(db) {
+    db.execute(`
+        CREATE KEYSPACE IF NOT EXISTS ${KS}
+        WITH replication = {
+          'class'              : 'NetworkTopologyStrategy',
+          'replication_factor' : ${RF}
+        }
+        AND tablets = {'enabled': ${TABLETS}}
+    `).await?;
+
+    db.execute(`
+        CREATE TABLE IF NOT EXISTS ${KS}.${TABLE} (
+            pk bigint,
+            ck bigint,
+            a int,
+            b int,
+            c int,
+            d int,
+            pad text,
+            PRIMARY KEY (pk, ck)
+        ) WITH caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
+          AND default_time_to_live = 5184000
+    `).await?;
+
+    for i in 0..=TABLE_COUNT-1 {
+        let ipadding = get_index_padding(i, TABLE_COUNT).await;
+        let table_name = `${TABLE_PREFIX}_${ipadding}${i}`;
+        db.execute(`
+            CREATE TABLE IF NOT EXISTS ${KS}.${table_name} (
+                pk bigint,
+                ck bigint,
+                a int,
+                b int,
+                c int,
+                d int,
+                pad text,
+                PRIMARY KEY (pk, ck)
+            ) WITH caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
+              AND default_time_to_live = 5184000
+        `).await?;
+    }
+}
+
+pub async fn prepare(db) {
+    db.init_partition_row_distribution_preset(
+        "main", TOTAL_ROWS, ROWS_PER_PARTITION, PARTITION_SIZES,
+    ).await?;
+
+    db.prepare(
+        "insert",
+        `INSERT INTO ${KS}.${TABLE} (pk, ck, a, b, c, d, pad) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).await?;
+
+    db.prepare(
+        "select",
+        `SELECT a, pad FROM ${KS}.${TABLE} WHERE pk = ? AND ck = ?`
+    ).await?;
+
+    // Full table scan with per-partition GROUP BY, filter on non-indexed column,
+    // and 20 aggregate computations across 4 columns — forces every row to be
+    // read, deserialized, filter-evaluated, and aggregated per partition group.
+    // With ~10K partitions the server maintains 10K separate aggregate states
+    // and returns 10K result rows instead of a single global aggregate.
+    db.prepare(
+        "heavy_select",
+        `SELECT AVG(a), MIN(a), MAX(a), COUNT(a), SUM(CAST(a AS bigint)),
+                AVG(b), MIN(b), MAX(b), COUNT(b), SUM(CAST(b AS bigint)),
+                AVG(c), MIN(c), MAX(c), COUNT(c), SUM(CAST(c AS bigint)),
+                AVG(d), MIN(d), MAX(d), COUNT(d), SUM(CAST(d AS bigint))
+         FROM ${KS}.${TABLE}`
+    ).await?;
+}
+
+fn pad(i) {
+    latte::text(i, 1000)
+}
+
+pub async fn write(db, i) {
+    let partition = db.get_partition_info("main", i).await;
+    let pk = hash(partition.idx);
+    let ck = hash(i);
+    let a  = hash_range(i, 1_000_000);
+    let b  = hash_range(i + 1, 1_000_000);
+    let c  = hash_range(i + 2, 1_000_000);
+    let d  = hash_range(i + 3, 1_000_000);
+
+    db.execute_prepared("insert", [pk, ck, a, b, c, d, pad(i)]).await
+}
+
+pub async fn read(db, i) {
+    let partition = db.get_partition_info("main", i).await;
+    let pk = hash(partition.idx);
+    let ck = hash(i);
+    db.execute_prepared("select", [pk, ck]).await
+}
+
+pub async fn heavy_read(db, i) {
+    // Range covers all possible 'a' values [0, 1_000_000] so every row
+    // matches the filter — maximizes rows evaluated, deserialized, and
+    // aggregated.  Combined with GROUP BY pk the server must maintain and
+    // return separate aggregate state for each of the ~10K partitions.
+    db.execute_prepared("heavy_select", [0, 1_000_000]).await
+}

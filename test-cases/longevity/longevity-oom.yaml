@@ -1,0 +1,55 @@
+test_duration: 90
+
+prepare_write_cmd:
+  - >-
+    latte run -f write -P tablets=false -P rows=100000 -P rows_per_partition=100
+    --rate 5000 --duration=10m --start-cycle 0 --tag insert
+    --retry-number=3 --retry-interval='1s,5s' --request-timeout=30
+    data_dir/latte/oom.rn
+
+round_robin: true
+stress_cmd:
+  - >-
+    latte run -f write:1 -f read:3 --tag mixed
+    --threads=4 --rate=300 --duration=180m
+    --retry-number=10 --retry-interval='500ms,5s' --request-timeout=30
+    data_dir/latte/oom.rn
+
+# 3 DCs across the globe: US East, US West, EU West — 10 nodes each (30 total)
+n_db_nodes: '10 10 10'
+n_loaders: '1 1 1'
+n_monitor_nodes: 1
+region_name: 'us-east-1 us-west-2 eu-west-1'
+
+instance_type_db: 't3.medium'
+data_volume_disk_num: 1
+data_volume_disk_type: "gp3"
+data_volume_disk_size: 500
+data_volume_disk_iops: 3000
+
+user_prefix: 'long-oom'
+cluster_health_check: true
+
+endpoint_snitch: GossipingPropertyFileSnitch
+internode_compression: 'all'
+
+nemesis_class_name: "SisyphusMonkey"
+nemesis_selector: 'MultipleNodesStopWaitStartMonkey'
+nemesis_stop_wait_start_sleep_time: 300
+nemesis_multi_node_restart_count: 3
+nemesis_during_prepare: false
+nemesis_interval: 5
+
+append_scylla_args: '--smp 2 --memory 2148M --logger-log-level gossip=debug'
+append_scylla_yaml:
+  enable_tablets: false
+  tablets_mode_for_new_keyspaces: 'disabled'
+  # NOTE: per table metrics on the big count of tables has terrible performance
+  # See: https://github.com/scylladb/scylla-monitoring/issues/2429
+  enable_node_aggregated_table_metrics: false
+  # Match customer cluster settings to add indirect memory/CPU pressure:
+  # - compaction competes with gossip for CPU on small nodes
+  # - 256 vnodes add ~5KB/endpoint to gossip TOKENS state and slow streaming on restart
+  compaction_enforce_min_threshold: true
+  compaction_static_shares: 100
+  num_tokens: 256
