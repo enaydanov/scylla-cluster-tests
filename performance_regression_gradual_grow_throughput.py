@@ -305,8 +305,6 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
         )
 
     def _base_test_workflow(self, workload: Workload, test_name):
-        stress_num = 1  # TODO: fix it to support multiple stress cmds per loader node (useful for latte)
-        num_loaders = len(self.loaders.nodes)
         self.run_fstrim_on_all_db_nodes()
         # run a write workload as a preparation
         if workload.preload_data and not skip_optional_stage("perf_preload_data"):
@@ -322,9 +320,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             self.wait_for_no_tablets_splits()
             self.run_fstrim_on_all_db_nodes()
 
-        self.run_gradual_increase_load(
-            workload=workload, stress_num=stress_num, num_loaders=num_loaders, test_name=test_name
-        )
+        self.run_gradual_increase_load(workload=workload, test_name=test_name)
 
     def run_post_prepare_cql(self, workload):
         if post_prepare_cql_cmds := self.params.get("post_prepare_cql_cmds"):
@@ -517,14 +513,16 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
         return workload
 
     @staticmethod
-    def current_throttle(throttle_step_dict, num_loaders, stress_num, stress_cmd):
+    def current_throttle(throttle_step_dict, num_processes, stress_cmd):
         """
         Generate throttle parameter from step dict.
 
         Args:
             throttle_step_dict: Dict with step parameters (must have 'rate' key)
-            num_loaders: Number of loader nodes
-            stress_num: Number of stress commands per loader
+            num_processes: Number of stress processes that will actually run this step
+                (e.g. n_loaders * auto_split_multiplier when '!auto_split' produced
+                more than one piece per loader), used to compute each process's
+                individual throttle rate from the total target rate.
             stress_cmd: Stress command to determine format
 
         Returns:
@@ -534,7 +532,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
         if rate == "unthrottled":
             return ""
 
-        throttle_value = int(int(rate) // (num_loaders * stress_num))
+        throttle_value = int(int(rate) // num_processes)
         if is_latte_command(stress_cmd):
             current_throttle = f"--rate={throttle_value}"
         elif stress_cmd.startswith("scylla-bench"):
@@ -546,8 +544,12 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
         return current_throttle
 
     # pylint: disable=too-many-arguments,too-many-locals
-    def run_gradual_increase_load(self, workload: Workload, stress_num, num_loaders, test_name):  # noqa: PLR0914
+    def run_gradual_increase_load(self, workload: Workload, test_name):  # noqa: PLR0914
         workload = self.update_num_threads_for_steps(workload=workload)
+        # Actual number of stress processes that will run this workload: normally one per
+        # loader, but '!auto_split' with 'auto_split_multiplier' > 1 produces more pieces
+        # than loaders, so each loader runs several of them concurrently.
+        num_processes = len(workload.cs_cmd_tmpl)
 
         if workload.cs_cmd_warm_up is not None:
             # Use the maximum thread count for warmup to ensure the cache is warmed up with the highest level of concurrency
@@ -584,9 +586,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
                 step_params["connections_per_host"] = workload.connections_per_host
 
             # Generate throttle parameter from rate
-            step_params["throttle"] = self.current_throttle(
-                throttle_step_dict, num_loaders, stress_num, workload.cs_cmd_tmpl[0]
-            )
+            step_params["throttle"] = self.current_throttle(throttle_step_dict, num_processes, workload.cs_cmd_tmpl[0])
 
             self.log.info(
                 "Run cs command with rate: %s Kops; threads: %s; step name: %s",
@@ -608,7 +608,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
 
             calculate_result = self._calculate_average_max_latency(results)
             summary_result = self.check_latency_during_steps(step=current_throttle_step)
-            summary_result[current_throttle_step].update({"ops_rate": calculate_result["op rate"] * num_loaders})
+            summary_result[current_throttle_step].update({"ops_rate": calculate_result["op rate"] * len(results)})
             total_summary.update(summary_result)
             if workload.drop_keyspace:
                 self.drop_keyspace(keyspace_name=workload.test_keyspace)

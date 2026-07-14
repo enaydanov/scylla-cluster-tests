@@ -1,0 +1,33 @@
+# "many connections" variant of cassandra_stress_gradual_load_steps_i8g.yaml.
+# Drives a high cassandra-stress connection count (connectionsPerHost) and thread count to
+# stress connection scaling. The throttle steps and step durations are kept identical to the
+# i8g fragment; only perf_gradual_connections_per_host and perf_gradual_threads differ.
+#perf_gradual_connections_per_host: 4000
+perf_gradual_connections_per_host: 500
+# perf_gradual_threads == perf_gradual_connections_per_host on purpose: the driver evenly spreads new
+# requests across the connection pool, but only min(threads, connectionsPerHost) connections can be
+# busy at any instant. Matching them keeps all opened connections simultaneously busy, not just open.
+#perf_gradual_threads: {"read": 4000, "write": 4000, "mixed": 4000, "read_disk_only": 4000}
+perf_gradual_threads: {"read": 500, "write": 4000, "mixed": 4000, "read_disk_only": 4000}
+## The value of perf_gradual_throttle_steps[load] is a percentage of the max throughput (unthrottled) for that load type, which is determined by a preliminary run of the stress command with no throttle and the specified thread count.
+#perf_gradual_throttle_steps: {"read": ['125000', '225000', '300000', '375000', 'unthrottled'], "mixed": ['62500', '120000', '150000', '187500', 'unthrottled'], "write": ['87500', '150000', 'unthrottled'], "read_disk_only": ['27500', '55000', '82500', '100000', 'unthrottled']}  # where every value is in ops
+perf_gradual_throttle_steps: {"read": ['225000', 'unthrottled'], "mixed": ['62500', '120000', '150000', '187500', 'unthrottled'], "write": ['87500', '150000', 'unthrottled'], "read_disk_only": ['27500', '55000', '82500', '100000', 'unthrottled']}  # where every value is in ops
+perf_gradual_step_duration: {"read": '10m', "write": None, "mixed": '10m', "read_disk_only": '10m'}
+
+n_loaders: 8
+instance_type_db: 'i8g.xlarge'
+instance_type_loader: 'c7i.xlarge'
+cs_extra_jvm_opts: '-XX:+UseZGC -XX:+ZGenerational -Xms4g -Xmx4g -XX:+AlwaysPreTouch'
+
+#auto_split_multiplier: 2
+
+prepare_write_cmd: !auto_split "cassandra-stress write cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=400 -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..162500001"
+stress_cmd_r: !auto_split "cassandra-stress read no-warmup cl=QUORUM duration=$duration -mode connectionsPerHost=$connections_per_host cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..5000000"
+stress_cmd_cache_warmup: !auto_split "cassandra-stress read cl=ALL n=5000000 -mode connectionsPerHost=$connections_per_host cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..5000000"
+
+#prepare_write_cmd: !auto_split "cassandra-stress write cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=400 -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..162500001"
+#stress_cmd_w: !auto_split "cassandra-stress write no-warmup cl=QUORUM n=402653184 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=$connections_per_host maxPending=24 cql3 native -port native=19042 -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..402653184"
+#stress_cmd_r: !auto_split "cassandra-stress read no-warmup cl=QUORUM duration=$duration -mode connectionsPerHost=$connections_per_host maxPending=24 cql3 native -port native=19042 -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..5000000"
+#stress_cmd_cache_warmup: !auto_split "cassandra-stress read cl=ALL n=5000000 -mode connectionsPerHost=$connections_per_host maxPending=24 cql3 native -port native=19042 -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..5000000"
+#stress_cmd_m: !auto_split "cassandra-stress mixed no-warmup cl=QUORUM duration=$duration -mode connectionsPerHost=$connections_per_host maxPending=24 cql3 native -port native=19042 -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..5000000"
+#stress_cmd_read_disk: !auto_split "cassandra-stress read no-warmup cl=QUORUM duration=$duration -mode connectionsPerHost=$connections_per_host maxPending=24 cql3 native -port native=19042 -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..162500001"

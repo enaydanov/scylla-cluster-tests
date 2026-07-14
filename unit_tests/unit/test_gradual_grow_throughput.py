@@ -183,3 +183,57 @@ def test_get_test_table_name_non_latte_ignores_schema_params():
             {"latte_schema_parameters": {"keyspace": "my_latte_ks", "table": "my_latte_tbl"}},
             ["cassandra-stress write cl=QUORUM n=1000"],
         )
+
+
+# ---------------------------------------------------------------------------
+# current_throttle: per-process throttle rate must divide by the actual number
+# of stress processes that will run, not by loader-node count alone - this
+# matters once '!auto_split'/'auto_split_multiplier' can produce more pieces
+# (hence more concurrent processes per loader) than there are loader nodes.
+# ---------------------------------------------------------------------------
+
+
+def _current_throttle(throttle_step_dict, num_processes, stress_cmd):
+    return gradual_grow_module.PerformanceRegressionPredefinedStepsTest.current_throttle(
+        throttle_step_dict, num_processes, stress_cmd
+    )
+
+
+def test_current_throttle_divides_by_num_processes_for_cassandra_stress():
+    """Plain case: one process per loader (num_processes == n_loaders)."""
+    result = _current_throttle({"rate": "40000"}, 4, "cassandra-stress write cl=QUORUM")
+    assert result == "fixed=10000/s"
+
+
+def test_current_throttle_accounts_for_auto_split_multiplier():
+    """With n_loaders=4 and auto_split_multiplier=2, !auto_split produces 8 pieces -
+    num_processes must be 8 (not 4), so each process gets 1/8th of the target rate,
+    not 1/4th (which would double the actual total achieved throughput)."""
+    n_loaders = 4
+    auto_split_multiplier = 2
+    num_processes = n_loaders * auto_split_multiplier
+    result = _current_throttle({"rate": "80000"}, num_processes, "cassandra-stress write cl=QUORUM")
+    assert result == "fixed=10000/s"
+
+
+def test_current_throttle_unthrottled_returns_empty_string():
+    result = _current_throttle({"rate": "unthrottled"}, 4, "cassandra-stress write cl=QUORUM")
+    assert result == ""
+
+
+def test_current_throttle_scylla_bench_format():
+    result = _current_throttle({"rate": "10000"}, 5, "scylla-bench -workload=sequential -mode=write")
+    assert result == "-max-rate=2000"
+
+
+def test_current_throttle_latte_format():
+    result = _current_throttle({"rate": "10000"}, 5, "latte run /some/script.rn -f write")
+    assert result == "--rate=2000"
+
+
+def test_current_throttle_cql_stress_cassandra_stress_format():
+    """'cql-stress-cassandra-stress' doesn't start with 'scylla-bench'/isn't latte -
+    falls through to the cassandra-stress 'fixed=.../s' format, same as plain
+    cassandra-stress."""
+    result = _current_throttle({"rate": "10000"}, 5, "cql-stress-cassandra-stress write cl=QUORUM")
+    assert result == "fixed=2000/s"
