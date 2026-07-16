@@ -29,7 +29,7 @@ from textwrap import dedent
 
 import yaml
 import copy
-from typing import List, Union, Set, Literal, get_origin, get_args, ClassVar
+from typing import List, Union, Set, Literal, get_origin, get_args, ClassVar, Self
 from functools import cached_property, lru_cache
 
 from distutils.util import strtobool
@@ -185,6 +185,115 @@ def str_or_list_or_eval(value: Union[str, List[str], None]) -> List[str] | None:
 StringOrList = Annotated[
     list[str],
     BeforeValidator(str_or_list_or_eval),
+    InputType("str | list[str]"),
+    Field(json_schema_extra={"appendable": True}),
+]
+
+
+# Top-level operation count, e.g. "cassandra-stress write cl=ALL n=162500001 ...".
+_CS_TOP_LEVEL_N_PATTERN = re.compile(r"(?:^|\s)n=(\d+)(?=\s|$)")
+
+# Population sequence range, e.g. "-pop seq=1..162500001".
+_CS_POP_SEQ_PATTERN = re.compile(r"-pop\s+seq=(\d+)\.\.(\d+)")
+
+
+class Splittable(BaseModel):
+    """Field-level marker for a '!auto_split'-tagged YAML scalar.
+
+    Validate the tagged value looks like a splittable cassandra-stress command.
+    """
+
+    value: str
+
+    @model_validator(mode="after")
+    def _validate_content(self) -> Self:
+        # The command may be prefixed with JVM options (e.g. JVM_OPTS="..." cassandra-stress ...)
+        # or be a "cql-stress-cassandra-stress variant.
+        if "cassandra-stress" not in self.value:
+            raise ValueError(
+                f"'!auto_split' tag used on a value that doesn't look like a cassandra-stress command: {self.value!r}"
+            )
+        if not _CS_POP_SEQ_PATTERN.search(self.value):
+            raise ValueError(
+                f"'!auto_split' tag used on a value with no splittable '-pop seq=X..Y' range: {self.value!r}"
+            )
+        return self
+
+    @staticmethod
+    def _split_evenly(total: int, num_parts: int) -> list[int]:
+        """Split `total` into `num_parts` positive-int chunks.
+
+        Uses floor division for the base chunk size; the last chunk absorbs any remainder
+        so the full `total` is always covered (no silent drop of leftover items).
+        """
+        chunk = total // num_parts
+        parts = [chunk] * num_parts
+        parts[-1] += total - chunk * num_parts
+        return parts
+
+    def split_stress_cmd(self, num_parts: int) -> list[str]:
+        """Split a single cassandra-stress command into `num_parts` commands.
+
+        The top-level 'n=' (if present) and the '-pop seq=X..Y' range are each divided
+        independently across `num_parts` (same chunk-size algorithm, remainder goes to
+        the last chunk), producing `num_parts` non-overlapping, contiguous seq sub-ranges
+        that collectively cover the original range.
+
+        Args:
+            stress_cmd: A single cassandra-stress command string containing a
+                '-pop seq=X..Y' range.
+            num_parts: Number of pieces to split into (typically sum(n_loaders)).
+
+        Returns:
+            A list of `num_parts` command strings.
+
+        Raises:
+            ValueError: if `stress_cmd` has no splittable '-pop seq=X..Y' range, or if
+                `num_parts` isn't a positive integer.
+        """
+        if num_parts < 1:
+            raise ValueError(f"num_parts must be >= 1, got {num_parts}")
+
+        seq_match = _CS_POP_SEQ_PATTERN.search(self.value)
+        if not seq_match:
+            raise ValueError(f"No splittable '-pop seq=X..Y' range found in: {self.value}")
+
+        if num_parts == 1:
+            return [self.value]
+
+        seq_start, seq_end = int(seq_match.group(1)), int(seq_match.group(2))
+        seq_chunks = self._split_evenly(seq_end - seq_start + 1, num_parts)
+
+        n_match = _CS_TOP_LEVEL_N_PATTERN.search(self.value)
+        n_chunks = self._split_evenly(int(n_match.group(1)), num_parts) if n_match else None
+
+        result = []
+        cursor = seq_start
+        for i in range(num_parts):
+            chunk_end = cursor + seq_chunks[i] - 1
+            cmd = _CS_POP_SEQ_PATTERN.sub(f"-pop seq={cursor}..{chunk_end}", self.value, count=1)
+            if n_match:
+                cmd = _CS_TOP_LEVEL_N_PATTERN.sub(f" n={n_chunks[i]}", cmd, count=1)
+            result.append(cmd)
+            cursor = chunk_end + 1
+
+        return result
+
+
+def str_or_list_or_eval_splittable(value: Splittable | str | list[str]) -> Splittable | list[str] | None:
+    """Like str_or_list_or_eval(), but also accepts a '!auto_split'-tagged value."""
+
+    if isinstance(value, Splittable):
+        return value
+    return str_or_list_or_eval(value)
+
+
+#: Like StringOrList, but the field may also (transiently, until
+#: _apply_cs_stress_cmd_auto_split() resolves it during SCTConfiguration.__init__())
+#: hold a single '!auto_split'-tagged value.
+SplittableStringOrList = Annotated[
+    Splittable | list[str],
+    BeforeValidator(str_or_list_or_eval_splittable),
     InputType("str | list[str]"),
     Field(json_schema_extra={"appendable": True}),
 ]
@@ -560,6 +669,16 @@ def _load_docker_images_defaults_cached():
             docker_images_defaults = anyconfig.load(yaml_files)
             return {key: value.get("image") for key, value in docker_images_defaults.items()}
     return None
+
+
+class SctYamlLoader(yaml.SafeLoader):
+    """Custom YAML loader for SCT configuration files."""
+
+    def construct_auto_split(self, node: yaml.ScalarNode) -> Splittable:
+        return Splittable(value=self.construct_scalar(node))
+
+
+SctYamlLoader.add_constructor("!auto_split", SctYamlLoader.construct_auto_split)
 
 
 class SCTConfiguration(BaseModel):
@@ -1049,8 +1168,9 @@ class SCTConfiguration(BaseModel):
     )
 
     # Stress Commands
-    stress_cmd: StringOrList = SctField(
-        description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. multiple commands can passed as a list",
+    stress_cmd: SplittableStringOrList = SctField(
+        description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. multiple commands can passed as a list. "
+        "A single command can be tagged '!auto_split' to evenly split it across all loaders (see round_robin).",
     )
     gemini_schema_url: String = SctField(
         description="""Path to a local schema JSON file or a remote URL (http/https) that Gemini will use.
@@ -1785,7 +1905,17 @@ class SCTConfiguration(BaseModel):
         description="Number of keyspaces to use in the test",
     )
     round_robin: Boolean = SctField(
-        description="Enable or disable round robin selection of nodes for operations",
+        description="Enable or disable round robin selection of nodes for operations. Must be "
+        "true when any stress_cmd_* field uses the '!auto_split' YAML tag (see stress_cmd_w), "
+        "since the resulting per-loader commands must be pinned one-to-one to each loader "
+        "instead of every piece running on every loader.",
+    )
+    auto_split_multiplier: int = SctField(
+        description="Multiplies the number of pieces '!auto_split' produces (default 1): "
+        "instead of exactly n_loaders pieces, produces n_loaders * auto_split_multiplier "
+        "pieces, so each loader runs this many parallel stress processes, each covering a "
+        "distinct sub-range. Requires round_robin: true whenever the total piece count "
+        "(n_loaders * auto_split_multiplier) is > 1.",
     )
     batch_size: int = SctField(
         description="Batch size for operations",
@@ -1867,28 +1997,31 @@ class SCTConfiguration(BaseModel):
     )
 
     # PerformanceRegressionTest
-    stress_cmd_w: StringOrList = SctField(
+    stress_cmd_w: SplittableStringOrList = SctField(
+        description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list. "
+        "A single command can be tagged '!auto_split' (e.g. stress_cmd_w: !auto_split \"cassandra-stress write n=1610612736 ... -pop seq=1..1610612736\") "
+        "to automatically split its top-level 'n=' and '-pop seq=X..Y' evenly across all configured loaders (requires round_robin: true). "
+        "Supported on: stress_cmd, stress_cmd_w, stress_cmd_r, stress_cmd_m, prepare_write_cmd, prepare_stress_cmd.",
+    )
+    stress_cmd_r: SplittableStringOrList = SctField(
         description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list",
     )
-    stress_cmd_r: StringOrList = SctField(
+    stress_cmd_m: SplittableStringOrList = SctField(
         description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list",
     )
-    stress_cmd_m: StringOrList = SctField(
-        description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list",
-    )
-    stress_cmd_read_disk: StringOrList = SctField(
+    stress_cmd_read_disk: SplittableStringOrList = SctField(
         description="""cassandra-stress commands.
                 You can specify everything but the -node parameter, which is going to
                 be provided by the test suite infrastructure.
                 multiple commands can passed as a list""",
     )
-    stress_cmd_cache_warmup: StringOrList = SctField(
+    stress_cmd_cache_warmup: SplittableStringOrList = SctField(
         description="""cassandra-stress commands for warm-up before read workload.
             You can specify everything but the -node parameter, which is going to
             be provided by the test suite infrastructure.
             multiple commands can passed as a list""",
     )
-    prepare_write_cmd: StringOrList = SctField(
+    prepare_write_cmd: SplittableStringOrList = SctField(
         description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list",
     )
     stress_before_migration: String = SctField(
@@ -1923,7 +2056,7 @@ class SCTConfiguration(BaseModel):
     stress_cmd_mv: StringOrList = SctField(
         description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list",
     )
-    prepare_stress_cmd: StringOrList = SctField(
+    prepare_stress_cmd: SplittableStringOrList = SctField(
         description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list",
     )
     perf_gradual_threads: DictOrStr = SctField(
@@ -2659,6 +2792,8 @@ class SCTConfiguration(BaseModel):
         "stress_cmd_w",
         "stress_cmd_r",
         "stress_cmd_m",
+        "stress_cmd_read_disk",
+        "stress_cmd_cache_warmup",
         "prepare_write_cmd",
         "stress_cmd_no_mv",
         "stress_cmd_no_mv_profile",
@@ -2764,7 +2899,7 @@ class SCTConfiguration(BaseModel):
         self.load_docker_images_defaults()
 
         # 1) load the default backend config files
-        files = anyconfig.load(list(backend_config_files))
+        files = anyconfig.load(list(backend_config_files), Loader=SctYamlLoader)
         merge_dicts_append_strings(self, files)
 
         # 2) load the config files
@@ -2772,7 +2907,7 @@ class SCTConfiguration(BaseModel):
             for conf_file in list(config_files):
                 if not os.path.exists(conf_file):
                     raise FileNotFoundError(f"Couldn't find config file: {conf_file}")
-            files = anyconfig.load(list(config_files))
+            files = anyconfig.load(list(config_files), Loader=SctYamlLoader)
             merge_dicts_append_strings(self, files)
 
         regions_data = self.get("regions_data") or {}
@@ -3336,6 +3471,8 @@ class SCTConfiguration(BaseModel):
             _value = self.get(_param)
             if _value and _env_name not in os.environ:
                 os.environ[_env_name] = str(_value)
+
+        self._apply_cs_stress_cmd_auto_split()
 
     def load_docker_images_defaults(self):
         stress_image = _load_docker_images_defaults_cached()
@@ -4031,6 +4168,43 @@ class SCTConfiguration(BaseModel):
                         f"perf_gradual_threads for {workload} should be a single-element, integer or list, "
                         f"or a list with the same length as perf_gradual_throttle_steps for {workload}"
                     )
+
+    def _apply_cs_stress_cmd_auto_split(self) -> None:
+        """Split a single cassandra-stress command evenly across configured loaders.
+
+        Divides the top-level 'n=' operation count and the '-pop seq=X..Y' population range
+        independently and proportionally across loaders, producing non-overlapping
+        sub-ranges that collectively cover the original range. Used to automate
+        the manual N-way command splitting seen in test-cases/performance/*.yaml (e.g.
+        prepare_write_cmd, stress_cmd_w).
+
+        'auto_split_multiplier' (default 1) multiplies the number of pieces produced per
+        loader, so each loader runs that many parallel stress processes, each covering a
+        distinct sub-range (relies on round_robin's cyclic loader assignment to spread the
+        extra pieces evenly across loaders.)
+
+        Raise ValueError if there are some command to split, but round_robin set to false.
+        """
+        match total_parts := self.get("n_loaders"):
+            case None:
+                return  # some unit tests don't set n_loaders and can fail
+            case list():
+                total_parts = sum(total_parts)
+        total_parts *= self.get("auto_split_multiplier")
+        did_split = False
+
+        for param_name in self.stress_cmd_params:
+            stress_cmd = self.get(param_name)
+            if isinstance(stress_cmd, Splittable):
+                self[param_name] = stress_cmd.split_stress_cmd(total_parts)
+                did_split = True
+
+        if did_split and total_parts > 1 and not self.get("round_robin"):
+            raise ValueError(
+                "'!auto_split' produced multiple commands for at least one field; "
+                "round_robin: true is required so each piece runs on exactly one loader "
+                "(otherwise every piece would run on every loader)"
+            )
 
     def _replace_docker_image_latest_tag(self):
         docker_repo = self.get("docker_image")

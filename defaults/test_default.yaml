@@ -145,6 +145,7 @@ stress_multiplier: 1
 stress_multiplier_w: 1
 stress_multiplier_r: 1
 stress_multiplier_m: 1
+auto_split_multiplier: 1
 keyspace_num: 1
 cs_user_profiles: []
 prepare_cs_user_profiles: []

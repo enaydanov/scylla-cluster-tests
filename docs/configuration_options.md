@@ -1116,11 +1116,11 @@ If true runs the nemesis only on non seed nodes
 
 ## **stress_cmd** / SCT_STRESS_CMD
 
-cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. multiple commands can passed as a list
+cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. multiple commands can passed as a list. A single command can be tagged '!auto_split' to evenly split it across all loaders (see round_robin).
 
 **default:** N/A
 
-**type:** str | list[str] → list[str] (appendable)
+**type:** str | list[str] → sdcm.sct_config.Splittable | list[str] (appendable)
 
 
 ## **gemini_schema_url** / SCT_GEMINI_SCHEMA_URL
@@ -3246,11 +3246,20 @@ Number of keyspaces to use in the test
 
 ## **round_robin** / SCT_ROUND_ROBIN
 
-Enable or disable round robin selection of nodes for operations
+Enable or disable round robin selection of nodes for operations. Must be true when any stress_cmd_* field uses the '!auto_split' YAML tag (see stress_cmd_w), since the resulting per-loader commands must be pinned one-to-one to each loader instead of every piece running on every loader.
 
 **default:** False
 
 **type:** bool
+
+
+## **auto_split_multiplier** / SCT_AUTO_SPLIT_MULTIPLIER
+
+Multiplies the number of pieces '!auto_split' produces (default 1): instead of exactly n_loaders pieces, produces n_loaders * auto_split_multiplier pieces, so each loader runs this many parallel stress processes, each covering a distinct sub-range. Requires round_robin: true whenever the total piece count (n_loaders * auto_split_multiplier) is > 1.
+
+**default:** 1
+
+**type:** int
 
 
 ## **batch_size** / SCT_BATCH_SIZE
@@ -3453,11 +3462,11 @@ Custom parameters of c-s write operation used in snapshots preparer
 
 ## **stress_cmd_w** / SCT_STRESS_CMD_W
 
-cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list
+cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list. A single command can be tagged '!auto_split' (e.g. stress_cmd_w: !auto_split "cassandra-stress write n=1610612736 ... -pop seq=1..1610612736") to automatically split its top-level 'n=' and '-pop seq=X..Y' evenly across all configured loaders (requires round_robin: true). Supported on: stress_cmd, stress_cmd_w, stress_cmd_r, stress_cmd_m, prepare_write_cmd, prepare_stress_cmd.
 
 **default:** N/A
 
-**type:** str | list[str] → list[str] (appendable)
+**type:** str | list[str] → sdcm.sct_config.Splittable | list[str] (appendable)
 
 
 ## **stress_cmd_r** / SCT_STRESS_CMD_R
@@ -3466,7 +3475,7 @@ cassandra-stress commands. You can specify everything but the -node parameter, w
 
 **default:** N/A
 
-**type:** str | list[str] → list[str] (appendable)
+**type:** str | list[str] → sdcm.sct_config.Splittable | list[str] (appendable)
 
 
 ## **stress_cmd_m** / SCT_STRESS_CMD_M
@@ -3475,7 +3484,7 @@ cassandra-stress commands. You can specify everything but the -node parameter, w
 
 **default:** N/A
 
-**type:** str | list[str] → list[str] (appendable)
+**type:** str | list[str] → sdcm.sct_config.Splittable | list[str] (appendable)
 
 
 ## **stress_cmd_read_disk** / SCT_STRESS_CMD_READ_DISK
@@ -3484,7 +3493,7 @@ cassandra-stress commands.<br>You can specify everything but the -node parameter
 
 **default:** N/A
 
-**type:** str | list[str] → list[str] (appendable)
+**type:** str | list[str] → sdcm.sct_config.Splittable | list[str] (appendable)
 
 
 ## **stress_cmd_cache_warmup** / SCT_STRESS_CMD_CACHE_WARMUP
@@ -3493,7 +3502,7 @@ cassandra-stress commands for warm-up before read workload.<br>You can specify e
 
 **default:** N/A
 
-**type:** str | list[str] → list[str] (appendable)
+**type:** str | list[str] → sdcm.sct_config.Splittable | list[str] (appendable)
 
 
 ## **prepare_write_cmd** / SCT_PREPARE_WRITE_CMD
@@ -3502,7 +3511,7 @@ cassandra-stress commands. You can specify everything but the -node parameter, w
 
 **default:** N/A
 
-**type:** str | list[str] → list[str] (appendable)
+**type:** str | list[str] → sdcm.sct_config.Splittable | list[str] (appendable)
 
 
 ## **stress_before_migration** / SCT_STRESS_BEFORE_MIGRATION
@@ -3601,7 +3610,7 @@ cassandra-stress commands. You can specify everything but the -node parameter, w
 
 **default:** N/A
 
-**type:** str | list[str] → list[str] (appendable)
+**type:** str | list[str] → sdcm.sct_config.Splittable | list[str] (appendable)
 
 
 ## **perf_gradual_threads** / SCT_PERF_GRADUAL_THREADS

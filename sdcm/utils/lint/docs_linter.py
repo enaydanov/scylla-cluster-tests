@@ -15,6 +15,15 @@ import yaml
 from sdcm.test_metadata import TestMetadata, _get_valid_backends
 
 
+# Strip !auto_split tag because docs_linter.py bypasses SCTConfiguration/anyconfig entirely.
+class StripAutoSplitLoader(yaml.SafeLoader):
+    def construct_auto_split(self, node: yaml.ScalarNode) -> str:
+        return self.construct_scalar(node)
+
+
+StripAutoSplitLoader.add_constructor("!auto_split", StripAutoSplitLoader.construct_auto_split)
+
+
 @dataclass
 class LintResult:
     file_path: str
@@ -40,7 +49,7 @@ def lint_test_metadata(config_path: Path, taxonomy_path: Path | None = None) -> 
 
     try:
         with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
+            config = yaml.load(f, StripAutoSplitLoader) or {}
     except (OSError, yaml.YAMLError) as exc:
         result.errors.append(f"TD-000: Failed to parse YAML: {exc}")
         return result
@@ -102,7 +111,7 @@ def cross_reference_config(config_path: Path) -> LintResult:
 
     try:
         with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
+            config = yaml.load(f, StripAutoSplitLoader) or {}
     except (OSError, yaml.YAMLError):
         return result
 

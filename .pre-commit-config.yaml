@@ -15,19 +15,6 @@ repos:
     -   id: end-of-file-fixer
         language: system  # Override the language
         exclude: ^(\.git/.*|argus/.*)$
-    -   id: check-yaml
-        language: system  # Override the language
-        args:
-        - --allow-multiple-documents
-        exclude: >
-            (?x)^(
-                tests/.*|
-                data_dir/scylla\.yaml|
-                sdcm/k8s_configs/minio/templates/.*|
-                sdcm/k8s_configs/monitoring/prometheus-operator/.*|
-                sdcm/k8s_configs/provisioner/templates/.*|
-                sdcm/k8s_configs/eks/storageclass_gp3.yaml
-            )$
     -   id: check-added-large-files
         language: system  # Override the language
         exclude: >
@@ -105,9 +92,23 @@ repos:
         pass_filenames: false
         files: ^pyproject.toml$
 
-- repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
-  rev: v9.22.0
-  hooks:
-      - id: commitlint
+-   repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
+    rev: v9.22.0
+    hooks:
+    -   id: commitlint
         stages: [commit-msg]
         language_version: 16.15.1
+
+-   repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.38.0
+    hooks:
+    -   id: yamllint
+        exclude: >
+            (?x)^(
+                tests/.*|
+                data_dir/scylla\.yaml|
+                sdcm/k8s_configs/minio/templates/.*|
+                sdcm/k8s_configs/monitoring/prometheus-operator/.*|
+                sdcm/k8s_configs/provisioner/templates/.*|
+                sdcm/k8s_configs/eks/storageclass_gp3.yaml
+            )$

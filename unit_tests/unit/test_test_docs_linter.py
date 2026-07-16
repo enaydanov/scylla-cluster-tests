@@ -238,3 +238,41 @@ def test_invalid_yaml_returns_error(tmp_path):
     result = lint_test_metadata(p)
     assert not result.passed
     assert any("TD-000" in e for e in result.errors)
+
+
+def test_auto_split_tag_does_not_crash_lint_test_metadata(tmp_path):
+    """A real test-case YAML using the '!auto_split' YAML tag (see sdcm/sct_config.py's
+    Splittable/SctYamlLoader) must not raise yaml.constructor.ConstructorError -
+    docs_linter.py bypasses SCTConfiguration/anyconfig entirely and previously used the
+    stock yaml.safe_load(), which doesn't know this tag."""
+    p = tmp_path / "test.yaml"
+    p.write_text(
+        """
+        n_loaders: 4
+        round_robin: true
+        prepare_write_cmd: !auto_split "cassandra-stress write cl=ALL n=100 -pop seq=1..100"
+        test_metadata:
+          description: "A valid description that is long enough to pass."
+        """
+    )
+    result = lint_test_metadata(p)
+    assert not any("TD-000" in e for e in result.errors)
+
+
+def test_auto_split_tag_does_not_crash_cross_reference_config(tmp_path):
+    """cross_reference_config() re-parses the file independently of lint_test_metadata()
+    (its own separate yaml.load() call) - it must not crash on the tag either, and should
+    still correctly detect the 'cassandra-stress' stress tool from the unwrapped value."""
+    p = tmp_path / "test.yaml"
+    p.write_text(
+        """
+        n_loaders: 4
+        round_robin: true
+        stress_cmd_w: !auto_split "cassandra-stress write cl=ALL n=100 -pop seq=1..100"
+        test_metadata:
+          description: "A valid description that is long enough to pass."
+          stress_tools: []
+        """
+    )
+    result = cross_reference_config(p)
+    assert any("TD-006" in w and "cassandra-stress" in w for w in result.warnings)
