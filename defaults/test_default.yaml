@@ -292,6 +292,9 @@ teardown_validators:
     enabled: false
   nvme:
     enabled: false
+  connections_per_shard:
+    enabled: false
+    min_connections: 0
 
 kafka_backend: null
 kafka_connectors: []

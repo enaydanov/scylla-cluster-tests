@@ -4341,7 +4341,9 @@ class ClusterTester(unittest.TestCase):
 
         self.log.info("Post test validators are starting...")
         for validator_class in teardown_validators_list:
-            validator_class(self.params, self).validate()
+            # a crashing validator must not skip the resource cleanup below, or the process never exits
+            with silence(parent=self, name=f"Teardown validator '{validator_class.validator_name}'"):
+                validator_class(self.params, self).validate()
         self.log.info("TearDown is starting...")
         self.stop_timeout_thread()
         self.stop_event_analyzer()

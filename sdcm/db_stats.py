@@ -214,7 +214,10 @@ class PrometheusDBStats:
 
     @retrying(n=5, sleep_time=7, allowed_exceptions=(requests.ConnectionError, requests.HTTPError))
     def request(self, url, post=False):
-        kwargs = {}
+        # (connect, read) timeouts: without them a terminated monitor node blocks each attempt for the kernel's
+        # ~130 s SYN timeout, and the retry layers turn that into a 45-minute teardown stall. Prometheus itself
+        # caps query evaluation at 2 minutes, so 130 s of read timeout loses nothing.
+        kwargs = {"timeout": (10, 130)}
         if self.protocol == "https":
             kwargs["verify"] = False
         if post:

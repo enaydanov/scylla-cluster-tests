@@ -1,0 +1,94 @@
+# Connection-scale test: ~30K CQL connections per shard, auth enabled, Rust driver (cql-stress).
+# On-demand run for SCYLLADB-4059 / CUSTOMER-676: a live cluster serving moderate traffic with
+# ~30K connections per shard for an extended period, no nemesis, no throughput/latency SLA.
+#
+# Connection arithmetic:
+#   per-shard connections   = connectionsPerShard x stress_multiplier              = 1250 x 24    = 30000
+#   per-process connections = connectionsPerShard x shards_per_node x n_db_nodes   = 1250 x 4 x 3 = 15000
+#   per-loader connections  = 6 processes x 15000                                  = 90000
+#   local ports per shard   = 6 x 1250 = 7500 per loader and node, of the 64512 / 4 = 16128 the range gives a shard
+# That is exactly the 30000 per shard the validator demands: every pool has to be full at the same moment,
+# which it is in steady state. 120K connections per 4-shard node is well under the 800000 LimitNOFILE of the
+# 2026.1 scylla-server unit. To scale the DB nodes up, add loaders and keep the per-loader product around
+# 90-100K (~30 KB RSS per connection in cql-stress).
+#
+# Why the -mode parameters: the Rust driver binds each shard-aware connection to a local port from a fixed
+# range (49152..65535 by default) without SO_REUSEADDR, so one loader IP can hold at most 16384 shard-aware
+# connections across all nodes and processes; past that it falls back to the non-shard-aware port and churns
+# the excess. shardAwarePortRange=1024..65535 gives ~64K ports and tcpReuseAddress=true lets one port carry a
+# connection to every node, so one loader holds 90K here and up to ~190K (cql-stress 0.5.0,
+# scylladb/cql-stress#202). Without them the first runs of this test needed 28 x 2-vCPU loaders with one
+# process each.
+#
+# Ramp: round_robin + stress_multiplier start one cql-stress process at a time, 10 s apart, round-robin over
+# the loaders, instead of everything at once. The first run started all loaders together on a cluster still
+# at 100% from an unthrottled prepare: 4 of them died on `Failed to change keyspace: RequestTimeout(5s)`
+# during session setup and the survivors churned connections on keepalive timeouts for 3 minutes. Staggered,
+# each 10 s window adds only 1250 connections per shard, so the auth/USE burst stays small.
+#
+# Dataset is deliberately tiny (1M rows, ~0.5 GB): every process writes the same range during prepare
+# (idempotent, throttled to ~2000 writes/s each), and the connection count - not data or CPU - is what this
+# test exercises. Steady state is 2 hours: longer runs showed the connection count and error profile are flat
+# once the ramp is over.
+#
+# Sized from measured load: ~30 KB RSS per connection; at the unthrottled peak the loaders (c7g.xlarge) ran at
+# ~78% CPU and 4.2 GB, so the 70% load leaves them headroom. The driver's keepalive adds ~12K OPTIONS requests/s
+# (360K connections, one every 30 s) on top of the operations at any load level.
+
+test_metadata:
+  description: >-
+    Connection-scale test: 4 loaders running 6 cql-stress (Rust driver) processes each with
+    connectionsPerShard=1250, started 10 s apart, against a 3-node cluster with PasswordAuthenticator,
+    reaching 30K CQL connections per shard (120K per node). Mixed load throttled to ~70% of the measured peak for 2 hours, no nemesis. Fails
+    unless every shard held 30K connections at the same time (teardown_validators.connections_per_shard).
+    On-demand run for SCYLLADB-4059 (customer case with ~30K connections/shard).
+  test_type: scale
+  tier: ondemand
+  duration_class: medium
+  supported_backends:
+    - aws
+  stress_tools:
+    - cql-stress-cassandra-stress
+  workload: mixed
+  features:
+    - authorization
+
+test_duration: 240
+
+# cql-stress 0.5.0 is the first release with the -mode parameters used below. Drop this override once the
+# default in defaults/docker_images/cql-stress-cassandra-stress reaches it.
+stress_image:
+  cql-stress-cassandra-stress: 'scylladb/cql-stress:0.5.0'
+
+prepare_write_cmd: "cql-stress-cassandra-stress write cl=QUORUM n=1000000 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native -rate 'threads=20 throttle=2000/s' -col 'size=FIXED(256) n=FIXED(2)' -pop seq=1..1000000 -log interval=15"
+
+# 24 processes (see stress_multiplier below) x 5400 ops/s = ~130K ops/s cluster-wide: ~70% of the 184.6K ops/s
+# (reads + inserts) the cluster served unthrottled while holding 30K connections per shard, reactor utilization
+# 95% (run 5bfc95d6, 2026.1.5, 3 x i8g.xlarge). Spread over 360K connections that is ~0.36 ops/s per connection,
+# so each connection is still nearly idle - like the customer's. 16 threads per process keep enough requests in
+# flight for the rate: rate x latency is ~5 at 70% load and stays under 16 through multi-millisecond spikes.
+stress_cmd: "cql-stress-cassandra-stress mixed cl=QUORUM duration=120m -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native connectionsPerShard=1250 shardAwarePortRange=1024..65535 tcpReuseAddress=true -rate 'threads=16 throttle=5400/s' -col 'size=FIXED(256) n=FIXED(2)' -pop seq=1..1000000 -log interval=15"
+
+n_db_nodes: 3
+n_loaders: 4
+# stress_multiplier makes 24 copies of each command; round_robin places them on the next loader in turn,
+# 6 per loader. Keep stress_multiplier a multiple of n_loaders.
+round_robin: true
+stress_multiplier: 24
+
+sizing_db:  # arm64 resolves to i8g.xlarge on AWS, the same Graviton family the customer runs (i8g.8xlarge)
+  vcpu: 4
+  memory: '>=32'
+  arch: arm64
+sizing_loader:  # 6 processes x 15000 connections per loader; no arch pin, the image is multi-arch and Graviton is cheaper
+  vcpu: 4
+  memory: '>=8'
+
+use_preinstalled_scylla: true
+
+user_prefix: 'longevity-30k-cps'
+
+teardown_validators:
+  connections_per_shard:
+    enabled: true
+    min_connections: 30000
