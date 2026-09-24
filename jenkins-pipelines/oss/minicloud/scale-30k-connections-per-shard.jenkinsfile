@@ -1,0 +1,20 @@
+#!groovy
+
+// The 30K-connections-per-shard test (SCYLLADB-4059) on minicloud instead of a real cloud.
+// `minicloud: true` adds the 'Start Minicloud' stage and points the EC2 API at localhost:5000;
+// configurations/minicloud/30k-connections-per-shard.yaml shrinks the test to 6 lightweight guests.
+
+def lib = library identifier: 'sct@snapshot', retriever: legacySCM(scm)
+
+longevityPipeline(
+    backend: 'aws',
+    region: 'eu-west-1',
+    test_name: 'longevity_test.LongevityTest.test_custom_time',
+    test_config: '''["test-cases/scale/longevity-30k-connections-per-shard.yaml", "configurations/auth_cassandra.yaml", "configurations/minicloud/30k-connections-per-shard.yaml", "configurations/minicloud.yaml"]''',
+    minicloud: true,
+    // A released version, NOT master:latest: minicloud builds guest disks from the AMI snapshot and
+    // the snapshots behind dev AMIs are not shared with the QA account. The customer runs 2026.1.x.
+    scylla_version: '2026.1.5',
+    provision_type: 'on_demand',
+    post_behavior_db_nodes: 'destroy',
+)

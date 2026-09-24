@@ -1,0 +1,51 @@
+# Shrinks test-cases/scale/longevity-30k-connections-per-shard.yaml to something a single KVM host
+# can run under minicloud (SCYLLADB-4059). Layer in this order:
+#
+#   -c test-cases/scale/longevity-30k-connections-per-shard.yaml \
+#   -c configurations/auth_cassandra.yaml \
+#   -c configurations/minicloud/30k-connections-per-shard.yaml \
+#   -c configurations/minicloud.yaml
+#
+# or `SCT_SCYLLA_VERSION=2026.1.5 scripts/run-minicloud-test.sh -f connections`.
+#
+# What survives the shrink is the number that matters: 30K CQL connections held by every shard at the
+# same time, with PasswordAuthenticator, and the teardown validator that fails the run otherwise.
+# What does not survive is everything around it: one shard per node instead of four, a tiny dataset,
+# ~1.2K ops/s instead of ~130K, one hour instead of two. Do not read CPU, latency or memory
+# conclusions off a local run; lightweight guests are 1 vCPU / minicloud_lightweight_memory.
+#
+# Connection arithmetic (see the base test-case for the port-ceiling background):
+#   per shard   = connectionsPerShard x stress_multiplier   = 1250 x 24 = 30000  (validator: >= 30000)
+#   per process = connectionsPerShard x shards x n_db_nodes = 1250 x 1 x 3 = 3750
+#   per loader  = 12 processes x 3750 = 45000, ~30 KB RSS each => ~1.4 GB of the 4 GiB guest
+# Per shard this is the production layout, so the ramp adds the same 1250 connections per shard every
+# 10 s. One loader would need ~2.7 GB for 24 processes and does not fit next to the OS and docker; two do.
+#
+# Guest budget: 3 db + 2 loaders + 1 monitor = 6 guests x 4GiB = 24GiB, plus ~2GiB host headroom.
+
+# 24 copies of this run too (stress_multiplier applies to prepare), each writing the same 50K rows at
+# 100 writes/s, so the 1-vCPU nodes see ~2.4K writes/s during the ~8 minute prepare.
+prepare_write_cmd: "cql-stress-cassandra-stress write cl=QUORUM n=50000 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native -rate 'threads=4 throttle=100/s' -col 'size=FIXED(256) n=FIXED(2)' -pop seq=1..50000 -log interval=15"
+
+# 24 x 50 ops/s = ~1.2K ops/s cluster-wide over 90K connections: each connection is nearly idle,
+# which is the customer's shape and what a 1-vCPU shard with 30K connections can serve.
+stress_cmd: "cql-stress-cassandra-stress mixed cl=QUORUM duration=60m -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native connectionsPerShard=1250 shardAwarePortRange=1024..65535 tcpReuseAddress=true -rate 'threads=8 throttle=50/s' -col 'size=FIXED(256) n=FIXED(2)' -pop seq=1..50000 -log interval=15"
+
+test_duration: 120
+
+n_db_nodes: 3
+n_loaders: 2
+stress_multiplier: 24
+# The validator needs Prometheus; the monitor is where it lives.
+n_monitor_nodes: 1
+
+# Lightweight mode caps every guest to 1 vCPU / minicloud_lightweight_memory regardless of the type,
+# so these only have to exist in the emulated catalog. A literal type also switches off the base
+# test-case's sizing_db (arm64), which would pick Graviton AMIs the x86 QEMU guests cannot boot.
+instance_type_db: 'i4i.large'
+instance_type_loader: 'i4i.large'
+
+# Nested virtualization for the QEMU guests (c8i/m8i/r8i only), and RAM for the 24GiB above.
+instance_type_runner: 'm8i.2xlarge'
+
+user_prefix: 'minicloud-30k-cps'
