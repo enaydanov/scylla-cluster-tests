@@ -258,6 +258,10 @@ function hydra_watchdog_unsupported_reason () {
 function hydra_watchdog () {
     set +e
     local interval=$1 now started rc out builder_view anomalies last_console=-1 child=""
+    # Watch the address the docker CLI and rsync actually connect through: the runner's private IP
+    # when hydra picked it, else the public one. Probing the other address would show neither the
+    # real flows on the builder nor, through SSH_CLIENT, on the runner.
+    local runner_host="${RUNNER_SSH_HOST:-${RUNNER_IP}}"
     out=$(mktemp) || return
     # Children run in the background and are waited on, so TERM is handled right away and
     # nothing outlives the watchdog holding hydra's stdout open.
@@ -283,13 +287,13 @@ function hydra_watchdog () {
         started=${SECONDS}
         # taken before the probe connects, so the probe's own socket isn't part of it
         builder_view=$(
-            echo "builder -> runner ${RUNNER_IP} sockets:"
-            hydra_ss_summary "( dst ${RUNNER_IP} and dport = :22 )"
-            ps -o pid=,etimes=,args= -C ssh | grep -F -- "${RUNNER_IP}" | sed 's/^/  ssh pid,age_s,args: /')
+            echo "builder -> runner ${runner_host} sockets:"
+            hydra_ss_summary "( dst ${runner_host} and dport = :22 )"
+            ps -o pid=,etimes=,args= -C ssh | grep -F -- "${runner_host}" | sed 's/^/  ssh pid,age_s,args: /')
         # No multiplexing: the probe must open its own connection, not ride a stalled master.
         timeout 60 ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15 \
             -o ControlMaster=no -o ControlPath=none \
-            -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "ubuntu@${RUNNER_IP}" \
+            -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "ubuntu@${runner_host}" \
             "WATCHDOG_NOW=${now}; $(declare -f hydra_ss_summary); ${probe}" \
             <<< "${builder_view}" >"${out}" 2>&1 &
         child=$!
