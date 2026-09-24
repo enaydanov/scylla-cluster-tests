@@ -2,7 +2,7 @@
 # One entry point for every local minicloud test flow.
 #
 # Usage:
-#   scripts/run-minicloud-test.sh [-b aws|gce] [-f ami|repo|provision|upgrade|scale] [-m direct|hydra]
+#   scripts/run-minicloud-test.sh [-b aws|gce] [-f ami|repo|provision|upgrade|scale|connections] [-m direct|hydra]
 #
 #   -b  backend to emulate                          (default: aws)
 #   -f  flavor: ami       - image-based artifacts test (AMI / GCE image)
@@ -10,6 +10,7 @@
 #               provision - provisioning smoke test (longevity + nemesis)
 #               upgrade   - rolling upgrade, 3 nodes, shrunk workloads
 #               scale     - cluster grow test, 3 -> 4 nodes, shrunk workloads
+#               connections - 30K CQL connections per shard with auth, 3 nodes, 1 hour
 #                                                   (default: ami)
 #   -m  direct: run sct.py from this checkout; hydra: run inside the hydra container
 #                                                   (default: direct)
@@ -89,7 +90,16 @@ case "$FLAVOR" in
         # that to 3 -> 4 nodes and sizes the load down to what a 1-vCPU guest can serve.
         EXTRA_CONFIGS=(configurations/minicloud/scale-cluster.yaml)
         ;;
-    *) echo "ERROR: unknown flavor '$FLAVOR' (ami|repo|provision|upgrade|scale)" >&2; exit 5 ;;
+    connections)
+        # SCYLLADB-4059: hold 30K CQL connections on every shard for an hour and fail unless they all
+        # got there (teardown_validators.connections_per_shard). Same test and test-case as
+        # jenkins-pipelines/oss/scale/scale-30k-connections-per-shard.jenkinsfile; the overlay cuts the
+        # 4-loader / 4-shard layout to 2 loaders x 12 cql-stress processes against 1-shard nodes.
+        TEST="longevity_test.LongevityTest.test_custom_time"
+        DEFAULT_CASE="test-cases/scale/longevity-30k-connections-per-shard.yaml"
+        EXTRA_CONFIGS=(configurations/auth_cassandra.yaml configurations/minicloud/30k-connections-per-shard.yaml)
+        ;;
+    *) echo "ERROR: unknown flavor '$FLAVOR' (ami|repo|provision|upgrade|scale|connections)" >&2; exit 5 ;;
 esac
 TEST_CASE="${SCT_TEST_CASE:-$DEFAULT_CASE}"
 # A --config given by the caller replaces the overlay's base, so do not shrink someone else's yaml.
