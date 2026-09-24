@@ -164,7 +164,8 @@ class CqlStressCassandraStressThread(CassandraStressThread):
             self.docker_image_name,
             command_line="-c 'tail -f /dev/null'",
             extra_docker_opts=f"{cpu_options} "
-            "--ulimit nofile=65536:65536 "
+            # one fd per CQL connection; fs.nr_open default, since 65536 caps large connection pools
+            "--ulimit nofile=1048576:1048576 "
             "--network=host "
             "--security-opt seccomp=unconfined "
             f"--label shell_marker={self.shell_marker}"
