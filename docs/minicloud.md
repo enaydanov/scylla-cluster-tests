@@ -183,7 +183,7 @@ export SCT_MINICLOUD_ENDPOINT_URL=http://localhost:5000
 ```
 
 `scripts/run-minicloud-test.sh` is the single local entry point - it starts the container via
-`sct.py start-minicloud` and runs the chosen flavor (`-f ami|repo|provision|upgrade`) on the chosen
+`sct.py start-minicloud` and runs the chosen flavor (`-f ami|repo|provision|upgrade|scale|connections`) on the chosen
 backend (`-b aws|gce`), directly or through hydra (`-m direct|hydra`), layering
 `configurations/minicloud.yaml` for you.
 
@@ -240,6 +240,20 @@ budgeting the initial cluster would pass and then let the run die at the exact m
 node nobody accounted for.
 `scripts/run-minicloud-clean-resources.sh` is a local-dev convenience only - the pipelines use
 the regular `clean-resources` path.
+
+The `connections` flavor runs `longevity_test.LongevityTest.test_custom_time` over
+`test-cases/scale/longevity-30k-connections-per-shard.yaml` - the connection-scale test built for
+SCYLLADB-4059, which holds 30K authenticated CQL connections on every shard under light load and
+fails the run unless every shard got there (`teardown_validators.connections_per_shard`):
+
+```bash
+SCT_SCYLLA_VERSION=2026.1.5 scripts/run-minicloud-test.sh -f connections
+```
+
+`configurations/minicloud/30k-connections-per-shard.yaml` keeps the per-shard number and drops
+everything else: 1-shard nodes instead of 4-shard ones, 2 loaders x 12 cql-stress processes instead
+of 4 loaders x 6, 50K rows, ~1.2K ops/s, one hour. 6 guests x `minicloud_lightweight_memory` = 24GiB
+plus host headroom.
 
 ## Troubleshooting
 
