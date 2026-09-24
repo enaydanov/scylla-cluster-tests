@@ -4,6 +4,7 @@ from unittest.mock import Mock, mock_open, patch
 import pytest
 
 from sdcm.sct_config import SCTConfiguration
+from sdcm.teardown_validators.connections import ConnectionsPerShardValidator
 from sdcm.teardown_validators.events import ErrorEventsValidator, Severity
 from sdcm.teardown_validators.rackaware import RackawareValidator
 
@@ -148,4 +149,50 @@ def test_rackaware_validator_skips_when_cluster_was_not_created(tester_mock):
 
     RackawareValidator(params, tester_mock).validate()
     # reaching the traffic comparison would have replaced get_test_status
+    tester_mock.get_test_status.assert_not_called()
+
+
+def _connections_validator(tester_mock, peak_values):
+    params = SCTConfiguration()
+    params.update({"teardown_validators": {"connections_per_shard": {"enabled": True, "min_connections": 30000}}})
+    tester_mock.prometheus_db.query.return_value = [
+        {"metric": {}, "values": [[i, str(v)] for i, v in enumerate(peak_values)]}
+    ]
+    return ConnectionsPerShardValidator(params, tester_mock)
+
+
+@patch("sdcm.teardown_validators.connections.ValidatorEvent")
+def test_connections_per_shard_passes_when_every_shard_reached_target(validator_event_mock, tester_mock):
+    _connections_validator(tester_mock, [0, 12000.5, 30000, 29000]).validate()
+
+    validator_event_mock.assert_not_called()
+    tester_mock.get_test_status.assert_not_called()
+
+
+@patch("sdcm.teardown_validators.connections.ValidatorEvent")
+def test_connections_per_shard_fails_when_a_shard_never_reached_target(validator_event_mock, tester_mock):
+    _connections_validator(tester_mock, [0, 29999]).validate()
+
+    validator_event_mock.assert_called_once()
+    assert "peaked at 29999" in validator_event_mock.call_args.kwargs["message"]
+    assert tester_mock.get_test_status() == "FAILED"
+
+
+@patch("sdcm.teardown_validators.connections.ValidatorEvent")
+def test_connections_per_shard_fails_without_any_samples(validator_event_mock, tester_mock):
+    validator = _connections_validator(tester_mock, [])
+    tester_mock.prometheus_db.query.return_value = []
+
+    validator.validate()
+
+    validator_event_mock.assert_called_once()
+    assert tester_mock.get_test_status() == "FAILED"
+
+
+def test_connections_per_shard_skips_without_prometheus(tester_mock):
+    validator = _connections_validator(tester_mock, [0])
+    tester_mock.prometheus_db = None
+
+    validator.validate()
+
     tester_mock.get_test_status.assert_not_called()
